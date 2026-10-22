@@ -408,3 +408,169 @@ su -c 'dmesg | grep -c region_num'                  # 0
 su -c 'cat /sys/class/misc/mali0/device/idle_hysteresis_time'  # 10000
 su -c 'grep -E "GPU-OPP|STACK-OPP" /proc/gpufreqv2/gpufreq_status'
 ```
+
+---
+
+# 第三部分：gpueb 6.12 backport
+
+## 19. 为什么要动 gpueb
+
+GED 的频率提交最终走 GPUEB 固件（双 buck 架构），GED 的 EB（Event Bridge）也要和固件通信。
+原机 gpueb 是 5.10 精简版（只导出调试和内存辅助函数），6.12 版提供了完整的 IPI 封装。
+
+## 20. 移植踩的 8 个坑
+
+| # | 问题 | 现象 | 解法 |
+|---|---|---|---|
+| 1 | `CONFIG_MTK_TINYSYS_GPUEB_SUPPORT` 未启用 | 编译 0 个文件 | 改用 `CONFIG_MTK_GPU_SUPPORT`（5.10 写法）|
+| 2 | **模块名与主文件同名冲突** | 只链主 .o，其他 .o 全丢 | 主文件改名 `gpueb_init.c` |
+| 3 | `-Wno-unused-but-set-variable` | Clang 报 unknown warning | 换 `-Wno-unused-variable` |
+| 4 | `pde_data()` vs `PDE_DATA()` | 5.10 用大写宏 | 改 .c + 2 个头文件 |
+| 5 | GHPM 符号缺失 | `ghpm_wrapper_init` 等未定义 | 兼容层，`g_ghpm_support=0` |
+| 6 | **`gpueb_dump_status` 签名变化** | **CRC 不匹配，gpufreq_wrapper 拒绝加载 → 卡开机** | 保留 5.10 ABI，6.12 实现改名 `_ex` |
+| 7 | **三个调试 DT 资源强制要求** | `fail to get resource GPUEB_GPR_BASE` → probe 失败 | 改为可选（代码本就有判空）|
+| 8 | **DT 属性名连字符 vs 下划线** | `ipi init fail`、`reserved mem init fail` | 20 处属性名改回下划线 |
+
+## 21. 坑 8 是真正的拦路虎
+
+6.12 把 DT 属性命名风格从下划线改成了连字符：
+
+```
+6.12 驱动读取          5.10 设备 DT 实际
+mbox-count         →  mbox_count
+mbox-size          →  mbox_size
+slot-size          →  slot_size
+ts-mbox            →  ts_mbox
+send-table         →  send_table
+recv-table         →  recv_table
+send-name-table    →  send_name_table
+recv-name-table    →  recv_name_table
+gpueb-mem-table    →  gpueb_mem_table
+```
+
+全部取不到 = 全空值 = `gpueb_ipi_init` 从头失败 → IPI channel 未注册 → gpufreq 拿不到频率服务 → 卡开机。
+
+## 22. 坑 6 的教训：CRC 才是 ABI 的真正契约
+
+`lsmod` 显示模块"已加载"不等于"能用"。第一次替换 gpueb 时：
+
+```
+gpueb 102400 1          ← 自己加载了
+（ged、mali 都没加载）   ← 依赖链断了
+```
+
+内核日志：
+
+```
+mtk_gpufreq_wrapper: disagrees about version of symbol gpueb_dump_status
+mtk_gpufreq_wrapper: Unknown symbol gpueb_dump_status (err -22)
+```
+
+**教训**：换模块时必须做**全量 CRC 比对**，不能只查符号存在性。
+
+```bash
+# 正确做法
+llvm-nm old.ko | grep '__crc_' | awk '{print $3,$1}' | sort > old_crc.txt
+llvm-nm new.ko | grep '__crc_' | awk '{print $3,$1}' | sort > new_crc.txt
+join -j1 old_crc.txt new_crc.txt | awk '$2!=$3{print "MISMATCH:", $1}'
+```
+
+## 23. 移植结果
+
+```
+name     = gpueb                      （保持原名，6.12 改叫 mtk_gpueb）
+vermagic = 5.10.269-g56de8342020a     精确匹配
+导出符号 = 73 个（原 56，新增 17）
+CRC      = 全部旧符号与原版一致（全量比对通过）
+```
+
+验证：
+
+```
+[GPU/EB][INFO] GPUEB driver probe done
+[GPU/FREQ][INFO] gpufreq wrapper driver probe done, dual_buck: true, gpueb: on
+[GPU-OPP] Index: 1, Freq: 880000, FmeterFreq: 879937
+Mali-G610 6 cores, GL_VERSION v1.r54p1-11eac0
+填充率 18.2 / 16.7 / 15.3 / 16.7 Gpix/s（无回退）
+```
+
+## 24. 仍未解决的问题：GED 的 EB 初始化
+
+gpueb 通了，但 GED 的 EB 仍卡在 DT 节点：
+
+```
+[GPU/GED][INFO] @ged_dvfs_system_init: Failed to find async_dvfs_node
+[GPU/GED][ERROR] gpu_slc_sysram_init: Cannot find gpu slc dts node
+[GPU/GED][ERROR] gpu_memsys_sysram_init: Cannot find gpu memsys dts node
+```
+
+`ged_eb.c` 的初始化要求两个节点：
+
+```c
+mtk_gpueb_dvfs_sysram_base_addr = _gpu_fastdvfs_of_ioremap("mediatek,gpu_fdvfs");
+if (NULL) { GPUFDVFS_LOGE("can't find fdvfs sysram"); return; }
+
+mtk_gpueb_base_addr = _gpu_fastdvfs_of_ioremap("mediatek,gpueb");
+if (NULL) { GPUFDVFS_LOGE("can't find gpueb"); return; }
+```
+
+两个节点在 xaga 的 DT 里都不存在。13T 的完整 DTB 里有现成定义可抄（同款 MT6895），
+但注意 13T 自己也设了 `fdvfs-policy-support = 0`，所以即使补上节点，能得到的可能
+只是 `gpu-freq-notify`（频率变化通知固件），而非完整的固件内调频。
+
+## 25. 调频架构的最终结论
+
+经过多轮实测，最终确定：
+
+```
+kbase 内置 DVFS（唯一决策源）
+    dvfs_callback (hrtimer, 20ms)
+      → kbase_pm_get_dvfs_action (算利用率)
+        → kbase_platform_dvfs_event (官方平台钩子，我们实现的)
+          → mtk_dvfs_apply (选档 + 提交)
+            → gpufreq_commit(TARGET_DEFAULT)
+              → 双 buck 映射 → GPUEB 固件 → GPU 域 + STACK 域
+```
+
+**GED 的调频引擎默认关闭**（`gpu_dvfs_enable=0`），原因：
+
+- 它的策略需要 MTK composer 喂的 KPI 帧数据，本机没有
+- 强制启用后它算出的目标恒为最低档，却仍周期性提交
+- 导致空闲时 GPU 误跳到 880MHz（实测 10 次采样有 1-2 次）
+
+**验证过的空转表现**（关闭我们的策略、只留 GED）：
+
+```
+GPU 利用率 100% 持续负载下，24 次采样全部锁死在 OPP 5（350MHz）
+```
+
+## 26. 关键数据备查（新增）
+
+```
+GPUEB 固件状态: /proc/gpueb/gpueb_status
+  GPUEB_CFGREG_WDT_KICK = 0x000ef63e   （看门狗在踢，固件运行中）
+
+GPUEB DT 节点资源（我们设备）:
+  gpueb_base mbox0_base mbox0_set mbox0_clr mbox0_send mbox0_recv
+  缺失（3 个）: gpueb_gpr_base gpueb_cfgreg_base mfg0_pwr_con
+  —— 只被 gpueb_debug.c 使用，且代码有判空，故改为可选
+
+模块加载顺序（依赖链）:
+  gpueb → mtk_gpufreq_wrapper → ged → mali_kbase_mt6895
+```
+
+## 27. 最终镜像构成（vendor_dlkm.img）
+
+```
+lib/modules/gpueb.ko                  184KB  gpueb 6.12 backport
+lib/modules/ged.ko                   2.0MB   GED 6.12 backport（EB IPI 已修复）
+lib/modules/mali_kbase_mt6895.ko     2.5MB   Mali r54 + kbase 内置 DVFS
+其余模块                                      原厂
+```
+
+vendor.img（921.5MB）：
+```
+lib64/egl/mt6895/libGLES_mali.so     51.7MB  r54 用户态
+etc/permissions/android.hardware.vulkan.version.xml        Vulkan 1.3
+etc/permissions/android.software.vulkan.deqp.level.xml     2025-03-01
+```

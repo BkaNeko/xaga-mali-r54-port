@@ -414,7 +414,17 @@ static int mtk_opp_last = -1;	/* lowest OPP index (highest numeric) */
 static int mtk_opp_max_freq;
 static int mtk_down_ticks;
 static int mtk_hold_ticks;
+static int mtk_up_ticks;
 static bool mtk_runtime_tuned;
+
+/* GED's own DVFS engine does not raise the GPU OPP on this platform (it only
+ * tracks the STACK domain), so this policy is the one that actually scales the
+ * GPU core frequency. Set to 0 only for experiments: the GPU then stays at the
+ * lowest OPP even at 100% utilisation. */
+static unsigned int mtk_policy_enable_param = 1;
+module_param_named(mtk_policy_enable, mtk_policy_enable_param, uint, 0644);
+MODULE_PARM_DESC(mtk_policy_enable,
+	"let the in-driver DVFS policy commit OPPs (default 0: GED owns DVFS)");
 
 static void mtk_opp_table_init(void)
 {
@@ -503,6 +513,75 @@ static void __maybe_unused mtk_stack_track(int gpu_freq_khz)
 		gpufreq_commit(TARGET_STACK, best);
 }
 
+/* OPP decision for a given GPU utilisation. Called from kbase's own DVFS
+ * timer (kbase_platform_dvfs_event) so the built-in mechanism drives
+ * frequency selection instead of a private workqueue.
+ */
+static void mtk_dvfs_apply(unsigned int loading)
+{
+	int cur_idx, target = -1;
+
+	cur_idx = gpufreq_get_cur_oppidx(TARGET_GPU);
+
+	/* If GED committed a frequency recently it is driving DVFS itself;
+	 * stay out of the way (official MTK behaviour). */
+	if (mtk_ged_last_commit &&
+	    time_before(jiffies, mtk_ged_last_commit + 3 * HZ))
+		return;
+
+	/* Performance-first policy modelled on MTK GED behaviour: ramp up
+	 * eagerly and hold the higher OPP for a few ticks before allowing a
+	 * downscale, so short idle gaps do not cause frequency flapping. */
+	if (loading >= 55)
+		target = 0;
+	else if (loading >= 35)
+		target = 1;
+	else if (loading >= 18)
+		target = 2;
+	else if (loading >= 6)
+		target = 3;
+	else
+		target = 4;
+
+	if (target > mtk_opp_last)
+		target = mtk_opp_last;
+
+	if (target < cur_idx) {
+		/* Require two consecutive samples before ramping: a single
+		 * spike (e.g. one composited frame) must not pull the GPU to
+		 * the top OPP, otherwise it idles at max frequency. */
+		if (++mtk_up_ticks < 2)
+			return;
+		mtk_up_ticks = 0;
+		mtk_hold_ticks = 10;	/* 200ms at max after ramp */
+		mtk_down_ticks = 0;
+	} else if (target > cur_idx) {
+		mtk_up_ticks = 0;
+		if (mtk_hold_ticks > 0) {
+			mtk_hold_ticks--;
+			return;
+		}
+		if (++mtk_down_ticks < 50)	/* 1s of sustained idle */
+			return;
+	} else {
+		mtk_down_ticks = 0;
+		mtk_hold_ticks = 0;
+		mtk_up_ticks = 0;
+		return;
+	}
+
+	if (target != cur_idx) {
+		int ret = mtk_common_gpufreq_commit(mtk_opp_index[target]);
+
+		mtk_down_ticks = 0;
+		if (ret)
+			pr_info_ratelimited(
+				"mtk-gpufreq: commit %d->%d(idx %d) failed ret=%d\n",
+				cur_idx, target, mtk_opp_index[target], ret);
+	}
+
+}
+
 static void mtk_dvfs_policy_fn(struct work_struct *work)
 {
 	struct kbase_device *kbdev = (struct kbase_device *)mtk_common_get_kbdev();
@@ -513,6 +592,9 @@ static void mtk_dvfs_policy_fn(struct work_struct *work)
 #endif
 
 	if (IS_ERR_OR_NULL(kbdev))
+		goto out;
+
+	if (!mtk_policy_enable_param)
 		goto out;
 
 	/* gpufreq rejects commits before the GPU is up; skip early ticks */
@@ -545,62 +627,40 @@ static void mtk_dvfs_policy_fn(struct work_struct *work)
 	mtk_common_cal_gpu_utilization(&loading, &block, &idle);
 #endif
 
-	cur_idx = gpufreq_get_cur_oppidx(TARGET_GPU);
 
-	/* If GED committed a frequency recently it is driving DVFS itself;
-	 * stay out of the way (official MTK behaviour). */
-	if (mtk_ged_last_commit &&
-	    time_before(jiffies, mtk_ged_last_commit + 3 * HZ))
-		goto out;
-
-	/* Performance-first policy modelled on MTK GED behaviour: ramp up
-	 * eagerly and hold the higher OPP for a few ticks before allowing a
-	 * downscale, so short idle gaps do not cause frequency flapping. */
-	if (loading >= 55)
-		target = 0;
-	else if (loading >= 35)
-		target = 1;
-	else if (loading >= 18)
-		target = 2;
-	else if (loading >= 6)
-		target = 3;
-	else
-		target = 4;
-
-	if (target > mtk_opp_last)
-		target = mtk_opp_last;
-
-	if (target < cur_idx) {
-		/* upscale immediately, then hold */
-		mtk_hold_ticks = 10;	/* 200ms at max after ramp */
-		mtk_down_ticks = 0;
-	} else if (target > cur_idx) {
-		if (mtk_hold_ticks > 0) {
-			mtk_hold_ticks--;
-			goto out;
-		}
-		if (++mtk_down_ticks < 50)	/* 1s of sustained idle */
-			goto out;
-	} else {
-		mtk_down_ticks = 0;
-		mtk_hold_ticks = 0;
-		goto out;
-	}
-
-	if (target != cur_idx) {
-		int ret = mtk_common_gpufreq_commit(mtk_opp_index[target]);
-
-		mtk_down_ticks = 0;
-		if (ret)
-			pr_info_ratelimited(
-				"mtk-gpufreq: commit %d->%d(idx %d) failed ret=%d\n",
-				cur_idx, target, mtk_opp_index[target], ret);
-	}
 
 out:
 	if (mtk_dvfs_policy_running)
 		schedule_delayed_work(&mtk_dvfs_policy_work,
 				      msecs_to_jiffies(20));
+}
+
+
+/* Called by kbase_pm_get_dvfs_action() from the kbase DVFS hrtimer with the
+ * utilisation measured over one dvfs_period. This is the standard ARM kbase
+ * platform hook; MTK normally leaves it unimplemented and lets GED do the
+ * work, but GED's policy cannot run without MTK's frame/KPI feed.
+ */
+int kbase_platform_dvfs_event(struct kbase_device *kbdev, u32 utilisation)
+{
+	if (IS_ERR_OR_NULL(kbdev) || !mtk_policy_enable_param)
+		return 0;
+
+	if (!kbdev->pm.backend.gpu_ready)
+		return 0;
+
+	if (mtk_opp_last < 0) {
+		mtk_opp_table_init();
+		if (mtk_opp_last < 0)
+			return 0;
+	}
+
+	if (mtk_ged_last_commit &&
+	    time_before(jiffies, mtk_ged_last_commit + 3 * HZ))
+		return 0;
+
+	mtk_dvfs_apply(utilisation);
+	return 1;
 }
 
 /* ---- thermal cooling device ("thermal-devfreq-0") ---------------- */

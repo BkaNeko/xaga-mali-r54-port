@@ -1,0 +1,1042 @@
+diff -ruN a/ghpm_compat_510.c b/ghpm_compat_510.c
+--- a/ghpm_compat_510.c	1970-01-01 08:00:00.000000000 +0800
++++ b/ghpm_compat_510.c	2026-10-22 19:57:07.386107473 +0800
+@@ -0,0 +1,44 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Stubs for the GHPM (GPU Hardware Power Manager) interface.
++ *
++ * The upstream tree implements GHPM only for mt6991/mt6993.  MT6895 predates
++ * that hardware and uses the legacy power sequence, so the whole GHPM layer is
++ * left out of this build.  gpueb_init() still calls ghpm_wrapper_init(), hence
++ * these no-ops.
++ */
++#include <linux/types.h>
++#include <linux/platform_device.h>
++#include "include/ghpm_wrapper.h"
++
++unsigned int g_ghpm_support;
++EXPORT_SYMBOL(g_ghpm_support);
++
++void ghpm_wrapper_init(struct platform_device *pdev)
++{
++	/* no GHPM on this platform */
++	(void)pdev;
++	g_ghpm_support = 0;
++}
++
++int ghpm_ctrl(enum ghpm_state power, enum mfg0_off_state off_state)
++{
++	(void)power;
++	(void)off_state;
++	return GHPM_ERR;
++}
++
++/*
++ * With no GHPM the upstream implementation returns success immediately, so
++ * the IPI send path behaves exactly as on a GPUEB-always-on platform: there is
++ * no power sequence to run, just the IPI itself.
++ */
++int gpueb_ctrl(enum ghpm_state power,
++	enum mfg0_off_state off_state, enum gpueb_low_power_event event)
++{
++	(void)power;
++	(void)off_state;
++	(void)event;
++	return 0;
++}
++EXPORT_SYMBOL(gpueb_ctrl);
+diff -ruN a/gpueb.c b/gpueb.c
+--- a/gpueb.c	2026-10-22 19:57:07.382747911 +0800
++++ b/gpueb.c	1970-01-01 08:00:00.000000000 +0800
+@@ -1,309 +0,0 @@
+-// SPDX-License-Identifier: GPL-2.0
+-/*
+- * Copyright (C) 2019 MediaTek Inc.
+- */
+-
+-/**
+- * @file    gpueb.c
+- * @brief   GPUEB driver init and probe
+- */
+-
+-/**
+- * ===============================================
+- * SECTION : Include files
+- * ===============================================
+- */
+-
+-#include <linux/clk.h>
+-#include <linux/delay.h>
+-#include <linux/miscdevice.h>
+-#include <linux/platform_device.h>
+-#include <linux/pm.h>
+-#include <linux/proc_fs.h>
+-#include <linux/of.h>
+-#include <linux/of_address.h>
+-#include <linux/random.h>
+-#include <linux/regulator/consumer.h>
+-#include <linux/seq_file.h>
+-#include <linux/slab.h>
+-#include <linux/uaccess.h>
+-#include <mboot_params.h>
+-
+-#include "gpueb_common.h"
+-#include "gpueb_helper.h"
+-#include "gpueb_ipi.h"
+-#include "gpueb_logger.h"
+-#include "gpueb_reserved_mem.h"
+-#include "gpueb_plat_service.h"
+-#include "gpueb_hwvoter_dbg.h"
+-#include "gpueb_debug.h"
+-#include "gpueb_timesync.h"
+-#include "gpueb_common.h"
+-#include "ghpm_wrapper.h"
+-
+-/*
+- * ===============================================
+- * SECTION : Local functions declaration
+- * ===============================================
+- */
+-
+-static int __gpueb_pdrv_probe(struct platform_device *pdev);
+-
+-/*
+- * ===============================================
+- * SECTION : Local variables definition
+- * ===============================================
+- */
+-
+-static struct workqueue_struct *gpueb_logger_workqueue;
+-static void __iomem *g_gpueb_gpr_base;
+-static void __iomem *g_gpueb_cfgreg_base;
+-static void __iomem *g_mfg0_pwr_con;
+-
+-#if IS_ENABLED(CONFIG_PM)
+-static int gpueb_suspend(struct device *dev)
+-{
+-	gpueb_timesync_suspend();
+-	return 0;
+-}
+-
+-static int gpueb_resume(struct device *dev)
+-{
+-	gpueb_timesync_resume();
+-	return 0;
+-}
+-
+-static const struct dev_pm_ops gpueb_dev_pm_ops = {
+-	.suspend = gpueb_suspend,
+-	.resume  = gpueb_resume,
+-};
+-#endif
+-
+-static const struct of_device_id g_gpueb_of_match[] = {
+-	{ .compatible = "mediatek,gpueb" },
+-	{ /* sentinel */ }
+-};
+-
+-static struct platform_driver g_gpueb_pdrv = {
+-	.probe = __gpueb_pdrv_probe,
+-	.remove = NULL,
+-	.driver = {
+-		.name = "gpueb",
+-		.owner = THIS_MODULE,
+-		.of_match_table = g_gpueb_of_match,
+-#if IS_ENABLED(CONFIG_PM)
+-		.pm = &gpueb_dev_pm_ops,
+-#endif
+-	},
+-};
+-
+-const struct file_operations gpueb_log_file_ops = {
+-	.owner = THIS_MODULE,
+-	.read = gpueb_log_if_read,
+-	.open = gpueb_log_if_open,
+-	.poll = gpueb_log_if_poll,
+-};
+-
+-static struct miscdevice gpueb_device = {
+-	.minor = MISC_DYNAMIC_MINOR,
+-	.name = "gpueb",
+-	.fops = &gpueb_log_file_ops
+-};
+-
+-static int gpueb_create_files(void)
+-{
+-	int ret = 0;
+-
+-	ret = misc_register(&gpueb_device);
+-	if (unlikely(ret != 0)) {
+-		gpueb_log_i(GPUEB_TAG, "misc register failed");
+-		return ret;
+-	}
+-
+-	ret = device_create_file(gpueb_device.this_device,
+-			&dev_attr_gpueb_mobile_log);
+-	if (unlikely(ret != 0))
+-		return ret;
+-
+-	return 0;
+-}
+-
+-void __iomem *gpueb_get_gpr_base(void)
+-{
+-	return g_gpueb_gpr_base;
+-}
+-EXPORT_SYMBOL(gpueb_get_gpr_base);
+-
+-void __iomem *gpueb_get_gpr_addr(enum gpueb_sram_gpr_id gpr_id)
+-{
+-	return g_gpueb_gpr_base + gpr_id * SRAM_GPR_SIZE_4B;
+-}
+-EXPORT_SYMBOL(gpueb_get_gpr_addr);
+-
+-void __iomem *gpueb_get_cfgreg_base(void)
+-{
+-	return g_gpueb_cfgreg_base;
+-}
+-EXPORT_SYMBOL(gpueb_get_cfgreg_base);
+-
+-int get_mfg0_pwr_con(void)
+-{
+-	return readl(g_mfg0_pwr_con);
+-}
+-EXPORT_SYMBOL(get_mfg0_pwr_con);
+-
+-int mfg0_pwr_sta(void)
+-{
+-	return ((readl(g_mfg0_pwr_con) & MFG0_PWR_ACK_BITS) == MFG0_PWR_ACK_BITS)?
+-		MFG0_PWR_ON : MFG0_PWR_OFF;
+-}
+-EXPORT_SYMBOL(mfg0_pwr_sta);
+-
+-int is_gpueb_wfi(void)
+-{
+-	return ((readl(GPUEB_CFGREG_MDSP_CFG) & GPUEB_ON_WFI_BITS) == GPUEB_ON_WFI_BITS)? 1: 0;
+-}
+-EXPORT_SYMBOL(is_gpueb_wfi);
+-
+-/*
+- * GPUEB driver probe
+- */
+-static int __gpueb_pdrv_probe(struct platform_device *pdev)
+-{
+-	int ret = 0;
+-	unsigned int gpueb_support = 0;
+-	unsigned int gpueb_logger_support = 0;
+-	struct device_node *node;
+-	struct resource *res = NULL;
+-
+-	gpueb_log_i(GPUEB_TAG, "GPUEB driver probe start");
+-
+-	node = of_find_matching_node(NULL, g_gpueb_of_match);
+-	if (!node)
+-		gpueb_log_i(GPUEB_TAG, "find GPUEB node failed");
+-
+-	of_property_read_u32(pdev->dev.of_node, "gpueb-support",
+-			&gpueb_support);
+-	if (gpueb_support == 0) {
+-		gpueb_log_i(GPUEB_TAG, "Bypass the GPUEB driver probe");
+-		return 0;
+-	}
+-
+-	/* get gpueb gpr base*/
+-	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "gpueb_gpr_base");
+-	if (unlikely(!res)) {
+-		gpueb_log_i(GPUEB_TAG, "fail to get resource GPUEB_GPR_BASE");
+-		goto err;
+-	}
+-	g_gpueb_gpr_base = devm_ioremap(&pdev->dev, res->start, resource_size(res));
+-	if (unlikely(!g_gpueb_gpr_base)) {
+-		gpueb_log_i(GPUEB_TAG, "fail to ioremap gpr base: 0x%llx", (u64) res->start);
+-		goto err;
+-	}
+-
+-	/* get gpueb_cfgreg_base */
+-	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "gpueb_cfgreg_base");
+-	if (unlikely(!res)) {
+-		gpueb_log_i(GPUEB_TAG, "fail to get resource GPUEB_CFGREG_BASE");
+-		goto err;
+-	}
+-	g_gpueb_cfgreg_base = devm_ioremap(&pdev->dev, res->start, resource_size(res));
+-	if (unlikely(!g_gpueb_cfgreg_base)) {
+-		gpueb_log_i(GPUEB_TAG, "fail to ioremap cfgreg base: 0x%llx", (u64) res->start);
+-		goto err;
+-	}
+-
+-	/* get mfg0_pwr_con */
+-	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "mfg0_pwr_con");
+-	if (unlikely(!res)) {
+-		gpueb_log_i(GPUEB_TAG, "fail to get resource mfg0_pwr_con");
+-		goto err;
+-	}
+-	g_mfg0_pwr_con = devm_ioremap(&pdev->dev, res->start, resource_size(res));
+-	if (unlikely(!g_mfg0_pwr_con)) {
+-		gpueb_log_i(GPUEB_TAG, "fail to ioremap mfg0_pwr_con: 0x%llx", (u64) res->start);
+-		goto err;
+-	}
+-
+-	ret = gpueb_ipi_init(pdev);
+-	if (ret != 0)
+-		gpueb_log_i(GPUEB_TAG, "ipi init fail");
+-
+-	ret = gpueb_reserved_mem_init(pdev);
+-	if (ret != 0)
+-		gpueb_log_i(GPUEB_TAG, "reserved mem init fail");
+-
+-	of_property_read_u32(pdev->dev.of_node, "gpueb-logger-support",
+-			&gpueb_logger_support);
+-	if (gpueb_logger_support == 1) {
+-		gpueb_logger_workqueue = create_singlethread_workqueue("GPUEB_LOG_WQ");
+-		if (gpueb_logger_init(pdev,
+-				gpueb_get_reserve_mem_virt(0),
+-				gpueb_get_reserve_mem_size(0)) == -1) {
+-			gpueb_log_i(GPUEB_TAG, "logger init fail");
+-			goto err;
+-		}
+-
+-		ret = gpueb_create_files();
+-		if (unlikely(ret != 0)) {
+-			gpueb_log_i(GPUEB_TAG, "create files fail");
+-			goto err;
+-		}
+-	} else {
+-		gpueb_log_i(GPUEB_TAG, "gpueb no logger support.");
+-	}
+-
+-	/* init gpufreq debug */
+-	gpueb_debug_init(pdev);
+-
+-	ret = gpueb_timesync_init();
+-	if (ret) {
+-		gpueb_log_e(GPUEB_TAG, "GPUEB timesync init fail, ret=%d", ret);
+-		goto err;
+-	}
+-
+-#if !IPI_TEST
+-	gpueb_hw_voter_dbg_init();
+-#endif
+-
+-	ghpm_wrapper_init(pdev);
+-
+-	gpueb_log_i(GPUEB_TAG, "GPUEB driver probe done");
+-
+-	return 0;
+-
+-err:
+-	return -1;
+-}
+-
+-/*
+- * Register the GPUEB driver
+- */
+-static int __init __gpueb_init(void)
+-{
+-	int ret = 0;
+-
+-	gpueb_log_d(GPUEB_TAG, "start to initialize gpueb driver");
+-
+-	// Register platform driver
+-	ret = platform_driver_register(&g_gpueb_pdrv);
+-	if (ret)
+-		gpueb_log_i(GPUEB_TAG, "fail to register gpueb driver");
+-
+-	return ret;
+-}
+-
+-/*
+- * Unregister the GPUEB driver
+- */
+-static void __exit __gpueb_exit(void)
+-{
+-	platform_driver_unregister(&g_gpueb_pdrv);
+-}
+-
+-module_init(__gpueb_init);
+-module_exit(__gpueb_exit);
+-
+-MODULE_DEVICE_TABLE(of, g_gpueb_of_match);
+-MODULE_DESCRIPTION("MediaTek GPUEB-PLAT driver");
+-MODULE_LICENSE("GPL");
+diff -ruN a/gpueb_debug.c b/gpueb_debug.c
+--- a/gpueb_debug.c	2026-10-22 19:57:07.382796754 +0800
++++ b/gpueb_debug.c	2026-10-22 19:57:07.386027384 +0800
+@@ -63,7 +63,7 @@
+ 	return 0;
+ }
+ 
+-void gpueb_dump_status(char *log_buf, int *log_len, int log_size)
++void gpueb_dump_status_ex(char *log_buf, int *log_len, int log_size)
+ {
+ 	gpueb_pr_logbuf(GPUEB_TAG, log_buf, log_len, log_size,
+ 		"== [GPUEB STATUS] ==");
+@@ -155,6 +155,14 @@
+ 		gpueb_log_i(GPUEB_TAG, "skip null g_gpueb_mbox_sw_int");
+ 	}
+ }
++EXPORT_SYMBOL(gpueb_dump_status_ex);
++
++/* 5.10 ABI: mtk_gpufreq_wrapper imports the no-argument form, so the symbol
++ * (and its CRC) must stay as it was in the 5.10 tree. */
++void gpueb_dump_status(void)
++{
++	gpueb_dump_status_ex(NULL, NULL, 0);
++}
+ EXPORT_SYMBOL(gpueb_dump_status);
+ 
+ void gpueb_trigger_wdt(const char *name)
+diff -ruN a/gpueb_hwvoter_dbg.c b/gpueb_hwvoter_dbg.c
+--- a/gpueb_hwvoter_dbg.c	2026-10-22 19:57:07.382887461 +0800
++++ b/gpueb_hwvoter_dbg.c	2026-10-22 19:57:07.387419523 +0800
+@@ -96,7 +96,7 @@
+ { \
+ 	return single_open(file, \
+ 					gpueb_ ## name ## _proc_show, \
+-					pde_data(inode)); \
++					PDE_DATA(inode)); \
+ } \
+ static const struct proc_ops \
+ 	gpueb_ ## name ## _proc_fops = {\
+@@ -114,7 +114,7 @@
+ {\
+ 	return single_open(file, \
+ 					gpueb_ ## name ## _proc_show, \
+-					pde_data(inode)); \
++					PDE_DATA(inode)); \
+ } \
+ static const struct proc_ops \
+ 	gpueb_ ## name ## _proc_fops = {\
+@@ -131,7 +131,7 @@
+ { \
+ 	return single_open(file, \
+ 					gpueb_ ## name ## _proc_show, \
+-					pde_data(inode)); \
++					PDE_DATA(inode)); \
+ } \
+ static const struct proc_ops \
+ 	gpueb_ ## name ## _proc_fops = {\
+diff -ruN a/gpueb_init.c b/gpueb_init.c
+--- a/gpueb_init.c	1970-01-01 08:00:00.000000000 +0800
++++ b/gpueb_init.c	2026-10-22 19:57:07.385974374 +0800
+@@ -0,0 +1,301 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright (C) 2019 MediaTek Inc.
++ */
++
++/**
++ * @file    gpueb.c
++ * @brief   GPUEB driver init and probe
++ */
++
++/**
++ * ===============================================
++ * SECTION : Include files
++ * ===============================================
++ */
++
++#include <linux/clk.h>
++#include <linux/delay.h>
++#include <linux/miscdevice.h>
++#include <linux/platform_device.h>
++#include <linux/pm.h>
++#include <linux/proc_fs.h>
++#include <linux/of.h>
++#include <linux/of_address.h>
++#include <linux/random.h>
++#include <linux/regulator/consumer.h>
++#include <linux/seq_file.h>
++#include <linux/slab.h>
++#include <linux/uaccess.h>
++#include <mboot_params.h>
++
++#include "gpueb_common.h"
++#include "gpueb_helper.h"
++#include "gpueb_ipi.h"
++#include "gpueb_logger.h"
++#include "gpueb_reserved_mem.h"
++#include "gpueb_plat_service.h"
++#include "gpueb_hwvoter_dbg.h"
++#include "gpueb_debug.h"
++#include "gpueb_timesync.h"
++#include "gpueb_common.h"
++#include "ghpm_wrapper.h"
++
++/*
++ * ===============================================
++ * SECTION : Local functions declaration
++ * ===============================================
++ */
++
++static int __gpueb_pdrv_probe(struct platform_device *pdev);
++
++/*
++ * ===============================================
++ * SECTION : Local variables definition
++ * ===============================================
++ */
++
++static struct workqueue_struct *gpueb_logger_workqueue;
++static void __iomem *g_gpueb_gpr_base;
++static void __iomem *g_gpueb_cfgreg_base;
++static void __iomem *g_mfg0_pwr_con;
++
++#if IS_ENABLED(CONFIG_PM)
++static int gpueb_suspend(struct device *dev)
++{
++	gpueb_timesync_suspend();
++	return 0;
++}
++
++static int gpueb_resume(struct device *dev)
++{
++	gpueb_timesync_resume();
++	return 0;
++}
++
++static const struct dev_pm_ops gpueb_dev_pm_ops = {
++	.suspend = gpueb_suspend,
++	.resume  = gpueb_resume,
++};
++#endif
++
++static const struct of_device_id g_gpueb_of_match[] = {
++	{ .compatible = "mediatek,gpueb" },
++	{ /* sentinel */ }
++};
++
++static struct platform_driver g_gpueb_pdrv = {
++	.probe = __gpueb_pdrv_probe,
++	.remove = NULL,
++	.driver = {
++		.name = "gpueb",
++		.owner = THIS_MODULE,
++		.of_match_table = g_gpueb_of_match,
++#if IS_ENABLED(CONFIG_PM)
++		.pm = &gpueb_dev_pm_ops,
++#endif
++	},
++};
++
++const struct file_operations gpueb_log_file_ops = {
++	.owner = THIS_MODULE,
++	.read = gpueb_log_if_read,
++	.open = gpueb_log_if_open,
++	.poll = gpueb_log_if_poll,
++};
++
++static struct miscdevice gpueb_device = {
++	.minor = MISC_DYNAMIC_MINOR,
++	.name = "gpueb",
++	.fops = &gpueb_log_file_ops
++};
++
++static int gpueb_create_files(void)
++{
++	int ret = 0;
++
++	ret = misc_register(&gpueb_device);
++	if (unlikely(ret != 0)) {
++		gpueb_log_i(GPUEB_TAG, "misc register failed");
++		return ret;
++	}
++
++	ret = device_create_file(gpueb_device.this_device,
++			&dev_attr_gpueb_mobile_log);
++	if (unlikely(ret != 0))
++		return ret;
++
++	return 0;
++}
++
++void __iomem *gpueb_get_gpr_base(void)
++{
++	return g_gpueb_gpr_base;
++}
++EXPORT_SYMBOL(gpueb_get_gpr_base);
++
++void __iomem *gpueb_get_gpr_addr(enum gpueb_sram_gpr_id gpr_id)
++{
++	return g_gpueb_gpr_base + gpr_id * SRAM_GPR_SIZE_4B;
++}
++EXPORT_SYMBOL(gpueb_get_gpr_addr);
++
++void __iomem *gpueb_get_cfgreg_base(void)
++{
++	return g_gpueb_cfgreg_base;
++}
++EXPORT_SYMBOL(gpueb_get_cfgreg_base);
++
++int get_mfg0_pwr_con(void)
++{
++	return readl(g_mfg0_pwr_con);
++}
++EXPORT_SYMBOL(get_mfg0_pwr_con);
++
++int mfg0_pwr_sta(void)
++{
++	return ((readl(g_mfg0_pwr_con) & MFG0_PWR_ACK_BITS) == MFG0_PWR_ACK_BITS)?
++		MFG0_PWR_ON : MFG0_PWR_OFF;
++}
++EXPORT_SYMBOL(mfg0_pwr_sta);
++
++int is_gpueb_wfi(void)
++{
++	return ((readl(GPUEB_CFGREG_MDSP_CFG) & GPUEB_ON_WFI_BITS) == GPUEB_ON_WFI_BITS)? 1: 0;
++}
++EXPORT_SYMBOL(is_gpueb_wfi);
++
++/*
++ * GPUEB driver probe
++ */
++static int __gpueb_pdrv_probe(struct platform_device *pdev)
++{
++	int ret = 0;
++	unsigned int gpueb_support = 0;
++	unsigned int gpueb_logger_support = 0;
++	struct device_node *node;
++	struct resource *res = NULL;
++
++	gpueb_log_i(GPUEB_TAG, "GPUEB driver probe start");
++
++	node = of_find_matching_node(NULL, g_gpueb_of_match);
++	if (!node)
++		gpueb_log_i(GPUEB_TAG, "find GPUEB node failed");
++
++	of_property_read_u32(pdev->dev.of_node, "gpueb-support",
++			&gpueb_support);
++	if (gpueb_support == 0) {
++		gpueb_log_i(GPUEB_TAG, "Bypass the GPUEB driver probe");
++		return 0;
++	}
++
++	/* The next three mappings are only used by the debug code, which already
++	 * guards them with NULL checks. Older platforms (MT6895 among them) do not
++	 * describe them in the device tree, so treat them as optional instead of
++	 * failing the probe -- without this the whole GPU stack stays down.
++	 */
++	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "gpueb_gpr_base");
++	if (res)
++		g_gpueb_gpr_base = devm_ioremap(&pdev->dev, res->start,
++						resource_size(res));
++	if (!g_gpueb_gpr_base)
++		gpueb_log_i(GPUEB_TAG, "no gpueb_gpr_base (debug only, skipped)");
++
++	/* get gpueb_cfgreg_base (optional, debug only) */
++	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "gpueb_cfgreg_base");
++	if (res)
++		g_gpueb_cfgreg_base = devm_ioremap(&pdev->dev, res->start,
++						   resource_size(res));
++	if (!g_gpueb_cfgreg_base)
++		gpueb_log_i(GPUEB_TAG, "no gpueb_cfgreg_base (debug only, skipped)");
++
++	/* get mfg0_pwr_con (optional, debug only) */
++	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "mfg0_pwr_con");
++	if (res)
++		g_mfg0_pwr_con = devm_ioremap(&pdev->dev, res->start,
++					      resource_size(res));
++	if (!g_mfg0_pwr_con)
++		gpueb_log_i(GPUEB_TAG, "no mfg0_pwr_con (debug only, skipped)");
++
++	ret = gpueb_ipi_init(pdev);
++	if (ret != 0)
++		gpueb_log_i(GPUEB_TAG, "ipi init fail");
++
++	ret = gpueb_reserved_mem_init(pdev);
++	if (ret != 0)
++		gpueb_log_i(GPUEB_TAG, "reserved mem init fail");
++
++	of_property_read_u32(pdev->dev.of_node, "gpueb-logger-support",
++			&gpueb_logger_support);
++	if (gpueb_logger_support == 1) {
++		gpueb_logger_workqueue = create_singlethread_workqueue("GPUEB_LOG_WQ");
++		if (gpueb_logger_init(pdev,
++				gpueb_get_reserve_mem_virt(0),
++				gpueb_get_reserve_mem_size(0)) == -1) {
++			gpueb_log_i(GPUEB_TAG, "logger init fail");
++			goto err;
++		}
++
++		ret = gpueb_create_files();
++		if (unlikely(ret != 0)) {
++			gpueb_log_i(GPUEB_TAG, "create files fail");
++			goto err;
++		}
++	} else {
++		gpueb_log_i(GPUEB_TAG, "gpueb no logger support.");
++	}
++
++	/* init gpufreq debug */
++	gpueb_debug_init(pdev);
++
++	ret = gpueb_timesync_init();
++	if (ret) {
++		gpueb_log_e(GPUEB_TAG, "GPUEB timesync init fail, ret=%d", ret);
++		goto err;
++	}
++
++#if !IPI_TEST
++	gpueb_hw_voter_dbg_init();
++#endif
++
++	ghpm_wrapper_init(pdev);
++
++	gpueb_log_i(GPUEB_TAG, "GPUEB driver probe done");
++
++	return 0;
++
++err:
++	return -1;
++}
++
++/*
++ * Register the GPUEB driver
++ */
++static int __init __gpueb_init(void)
++{
++	int ret = 0;
++
++	gpueb_log_d(GPUEB_TAG, "start to initialize gpueb driver");
++
++	// Register platform driver
++	ret = platform_driver_register(&g_gpueb_pdrv);
++	if (ret)
++		gpueb_log_i(GPUEB_TAG, "fail to register gpueb driver");
++
++	return ret;
++}
++
++/*
++ * Unregister the GPUEB driver
++ */
++static void __exit __gpueb_exit(void)
++{
++	platform_driver_unregister(&g_gpueb_pdrv);
++}
++
++module_init(__gpueb_init);
++module_exit(__gpueb_exit);
++
++MODULE_DEVICE_TABLE(of, g_gpueb_of_match);
++MODULE_DESCRIPTION("MediaTek GPUEB-PLAT driver");
++MODULE_LICENSE("GPL");
+diff -ruN a/gpueb_ipi.c b/gpueb_ipi.c
+--- a/gpueb_ipi.c	2026-10-22 19:57:07.382940402 +0800
++++ b/gpueb_ipi.c	2026-10-22 19:57:07.386163645 +0800
+@@ -62,7 +62,7 @@
+ 	gpueb_mboxdev.name = GPUEB_MBOXDEV_NAME;
+ 
+ 	// Get MBOX num
+-	of_property_read_u32(pdev->dev.of_node, "mbox-count",
++	of_property_read_u32(pdev->dev.of_node, "mbox_count",
+ 			&gpueb_mboxdev.count);
+ 	if (!gpueb_mboxdev.count) {
+ 		gpueb_log_d(GPUEB_TAG, "mbox count not found");
+@@ -70,7 +70,7 @@
+ 	}
+ 
+ 	// Get MBOX size
+-	of_property_read_u32(pdev->dev.of_node, "mbox-size",
++	of_property_read_u32(pdev->dev.of_node, "mbox_size",
+ 			&g_mbox_size);
+ 	if (g_mbox_size == 0) {
+ 		gpueb_log_d(GPUEB_TAG, "mbox size not found");
+@@ -78,7 +78,7 @@
+ 	}
+ 
+ 	// Get SLOT size
+-	of_property_read_u32(pdev->dev.of_node, "slot-size",
++	of_property_read_u32(pdev->dev.of_node, "slot_size",
+ 			&g_slot_size);
+ 	if (g_slot_size == 0) {
+ 		gpueb_log_d(GPUEB_TAG, "slot size not found");
+@@ -86,7 +86,7 @@
+ 	}
+ 
+ 	// Get mbox for timesync
+-	of_property_read_u32(pdev->dev.of_node, "ts-mbox",
++	of_property_read_u32(pdev->dev.of_node, "ts_mbox",
+ 			&g_ts_mbox);
+ 	if (g_ts_mbox > gpueb_mboxdev.count) {
+ 		gpueb_log_d(GPUEB_TAG, "ts-mbox(%d) > mbox-count(%d)",
+@@ -96,7 +96,7 @@
+ 
+ 	// Get send PIN num
+ 	cnt_elems = of_property_count_u32_elems(
+-			pdev->dev.of_node, "send-table");
++			pdev->dev.of_node, "send_table");
+ 	if (cnt_elems <= 0) {
+ 		gpueb_log_d(GPUEB_TAG, "send table not found");
+ 		return false;
+@@ -105,7 +105,7 @@
+ 
+ 	// Get recv PIN num
+ 	cnt_elems = of_property_count_u32_elems(
+-			pdev->dev.of_node, "recv-table");
++			pdev->dev.of_node, "recv_table");
+ 	if (cnt_elems <= 0) {
+ 		gpueb_log_d(GPUEB_TAG, "recv table not found");
+ 		return false;
+@@ -114,7 +114,7 @@
+ 
+ 	// Get send PIN name
+ 	ret = of_property_read_string_array(pdev->dev.of_node,
+-			"send-name-table",
++			"send_name_table",
+ 			gpueb_mbox_pin_send_name,
+ 			gpueb_mboxdev.send_count);
+ 	if (ret < 0) {
+@@ -137,7 +137,7 @@
+ 
+ 	// Get recv PIN name
+ 	ret = of_property_read_string_array(pdev->dev.of_node,
+-			"recv-name-table",
++			"recv_name_table",
+ 			gpueb_mbox_pin_recv_name,
+ 			gpueb_mboxdev.recv_count);
+ 	if (ret < 0) {
+@@ -180,7 +180,7 @@
+ 	gpueb_mbox_pin_send = gpueb_mboxdev.pin_send_table;
+ 	for (i = 0; i < gpueb_mboxdev.send_count; i++) {
+ 		ret = of_property_read_u32_index(pdev->dev.of_node,
+-				"send-table",
++				"send_table",
+ 				i * send_item_num,
+ 				&gpueb_mbox_pin_send[i].chan_id);
+ 		if (ret) {
+@@ -190,7 +190,7 @@
+ 		gpueb_mbox_pin_send[i].pin_index = gpueb_mbox_pin_send[i].chan_id;
+ 
+ 		ret = of_property_read_u32_index(pdev->dev.of_node,
+-				"send-table",
++				"send_table",
+ 				i * send_item_num + 1,
+ 				&mbox_id);
+ 		if (ret) {
+@@ -201,7 +201,7 @@
+ 		gpueb_mbox_pin_send[i].mbox = mbox_id;
+ 
+ 		ret = of_property_read_u32_index(pdev->dev.of_node,
+-				"send-table",
++				"send_table",
+ 				i * send_item_num + 2,
+ 				&gpueb_mbox_pin_send[i].msg_size);
+ 		if (ret) {
+@@ -218,7 +218,7 @@
+ 	gpueb_mbox_pin_recv = gpueb_mboxdev.pin_recv_table;
+ 	for (i = 0; i < gpueb_mboxdev.recv_count; ++i) {
+ 		ret = of_property_read_u32_index(pdev->dev.of_node,
+-				"recv-table",
++				"recv_table",
+ 				i * recv_item_num,
+ 				&gpueb_mbox_pin_recv[i].chan_id);
+ 		if (ret) {
+@@ -228,7 +228,7 @@
+ 		gpueb_mbox_pin_recv[i].pin_index = gpueb_mbox_pin_recv[i].chan_id;
+ 
+ 		ret = of_property_read_u32_index(pdev->dev.of_node,
+-				"recv-table",
++				"recv_table",
+ 				i * recv_item_num + 1,
+ 				&mbox_id);
+ 		if (ret) {
+@@ -239,7 +239,7 @@
+ 		gpueb_mbox_pin_recv[i].mbox = mbox_id;
+ 
+ 		ret = of_property_read_u32_index(pdev->dev.of_node,
+-				"recv-table",
++				"recv_table",
+ 				i * recv_item_num + 2,
+ 				&gpueb_mbox_pin_recv[i].msg_size);
+ 		if (ret) {
+@@ -248,7 +248,7 @@
+ 		}
+ 
+ 		ret = of_property_read_u32_index(pdev->dev.of_node,
+-				"recv-table",
++				"recv_table",
+ 				i * recv_item_num + 3,
+ 				&recv_opt);
+ 		if (ret) {
+@@ -259,7 +259,7 @@
+ 		gpueb_mbox_pin_recv[i].recv_opt = recv_opt;
+ 
+ 		ret = of_property_read_u32_index(pdev->dev.of_node,
+-				"recv-table",
++				"recv_table",
+ 				i * recv_item_num + 4,
+ 				&cb_opt);
+ 		if (ret) {
+diff -ruN a/gpueb_reserved_mem.c b/gpueb_reserved_mem.c
+--- a/gpueb_reserved_mem.c	2026-10-22 19:57:07.383074075 +0800
++++ b/gpueb_reserved_mem.c	2026-10-22 19:57:07.386304889 +0800
+@@ -162,7 +162,7 @@
+ 	// Set reserved memory table
+ 	gpueb_mem_num = of_property_count_u32_elems(
+ 			pdev->dev.of_node,
+-			"gpueb-mem-table")
++			"gpueb_mem_table")
+ 			/ MEMORY_TBL_ELEM_NUM;
+ 	if (gpueb_mem_num <= 0) {
+ 		gpueb_log_d(GPUEB_TAG, "gpueb-mem-table not found");
+@@ -171,7 +171,7 @@
+ 
+ 	// Get reserved mblock name
+ 	ret = of_property_read_string_array(pdev->dev.of_node,
+-			"gpueb-mem-name-table",
++			"gpueb_mem_name_table",
+ 			gpueb_reserve_mblock_ary_name,
+ 			gpueb_mem_num);
+ 	if (ret < 0) {
+@@ -189,7 +189,7 @@
+ 	for (i = 0; i < gpueb_mem_num; i++) {
+ 		// Get reserved block's ID
+ 		ret = of_property_read_u32_index(pdev->dev.of_node,
+-				"gpueb-mem-table",
++				"gpueb_mem_table",
+ 				i * MEMORY_TBL_ELEM_NUM,
+ 				&m_idx);
+ 		if (ret) {
+@@ -200,7 +200,7 @@
+ 
+ 		// Get reserved block's size
+ 		ret = of_property_read_u32_index(pdev->dev.of_node,
+-				"gpueb-mem-table",
++				"gpueb_mem_table",
+ 				(i * MEMORY_TBL_ELEM_NUM) + 1,
+ 				&m_size);
+ 		if (ret) {
+diff -ruN a/include/ghpm_debug.h b/include/ghpm_debug.h
+--- a/include/ghpm_debug.h	2026-10-22 19:57:07.383180661 +0800
++++ b/include/ghpm_debug.h	2026-10-22 19:57:07.386961684 +0800
+@@ -17,7 +17,7 @@
+ 		return single_open(           \
+ 				file,                 \
+ 				name ## _proc_show,   \
+-				pde_data(inode));     \
++				PDE_DATA(inode));     \
+ 	}                                 \
+ 	static const struct proc_ops name ## _proc_fops = \
+ 	{                                 \
+@@ -36,7 +36,7 @@
+ 		return single_open(           \
+ 				file,                 \
+ 				name ## _proc_show,   \
+-				pde_data(inode));     \
++				PDE_DATA(inode));     \
+ 	}                                 \
+ 	static const struct proc_ops name ## _proc_fops = \
+ 	{                                 \
+diff -ruN a/include/gpueb_debug.h b/include/gpueb_debug.h
+--- a/include/gpueb_debug.h	2026-10-22 19:57:07.383452148 +0800
++++ b/include/gpueb_debug.h	2026-10-22 19:57:07.386403876 +0800
+@@ -47,7 +47,7 @@
+ 		return single_open(           \
+ 				file,                 \
+ 				name ## _proc_show,   \
+-				pde_data(inode));     \
++				PDE_DATA(inode));     \
+ 	}                                 \
+ 	static const struct proc_ops name ## _proc_fops = \
+ 	{                                 \
+@@ -66,7 +66,7 @@
+ 		return single_open(           \
+ 				file,                 \
+ 				name ## _proc_show,   \
+-				pde_data(inode));     \
++				PDE_DATA(inode));     \
+ 	}                                 \
+ 	static const struct proc_ops name ## _proc_fops = \
+ 	{                                 \
+@@ -101,7 +101,8 @@
+  **************************************************/
+ void gpueb_debug_init(struct platform_device *pdev);
+ void gpueb_trigger_wdt(const char *name);
+-void gpueb_dump_status(char *log_buf, int *log_len, int log_size);
++void gpueb_dump_status_ex(char *log_buf, int *log_len, int log_size);
++void gpueb_dump_status(void);
+ unsigned int get_gpueb_infra_rx_info(void);
+ 
+ #endif /* __GPUEB_DEBUG_H__ */
+diff -ruN a/Makefile b/Makefile
+--- a/Makefile	2026-10-22 19:57:07.382416562 +0800
++++ b/Makefile	2026-10-22 19:57:07.391221537 +0800
+@@ -5,23 +5,29 @@
+ # it under the terms of the GNU General Public License version 2 as
+ # published by the Free Software Foundation.
+ #
+-# This program is distributed in the hope that it will be useful,
+-# but WITHOUT ANY WARRANTY; without even the implied warranty of
+-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+-# GNU General Public License for more details.
++# GED 6.12 backport: same source tree, built for the 5.10 kernel.
++#
++# Notes:
++#  - module name stays "gpueb" (ged / mtk_gpufreq_wrapper / fhctl depend
++#    on that name; 6.12 renamed it to mtk_gpueb)
++#  - the GHPM sources are deliberately not built: they only implement
++#    mt6991/mt6993 hardware, MT6895 has no GHPM
+ #
+ 
+-ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/include/mt-plat/
+-ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/gpu/mediatek/gpueb/include/
+-
+-ccflags-y += -Wno-unused-but-set-variable
++ccflags-y += -I$(srctree)/drivers/misc/mediatek/include/mt-plat/
++ccflags-y += -I$(srctree)/drivers/gpu/mediatek/gpueb612/include/
++ccflags-y += -Wno-unused-variable
++ccflags-y += -Wno-error=macro-redefined
++ccflags-y += -Wno-error=implicit-function-declaration
++ccflags-y += -Wno-error=incompatible-function-pointer-types
++ccflags-y += -Wno-error=incompatible-pointer-types
++ccflags-y += -Wno-error=int-conversion
++ccflags-y += -Wno-error=declaration-after-statement
+ 
+-# ifneq ($(CONFIG_MTK_GPU_LEGACY),y)
+-# obj-$(CONFIG_MTK_TINYSYS_GPUEB_SUPPORT) += mtk_gpueb.o
+-# endif
++obj-$(CONFIG_MTK_GPU_SUPPORT) += gpueb.o
+ 
+-mtk_gpueb-y += \
+-    gpueb.o \
++gpueb-y += \
++    gpueb_init.o \
+     gpueb_ipi.o \
+     gpueb_logger.o \
+     gpueb_plat_service.o \
+@@ -30,32 +36,6 @@
+     gpueb_hwvoter_dbg.o \
+     gpueb_debug.o \
+     gpueb_timesync.o \
+-    ghpm_wrapper.o \
+-    ghpm_debug.o
+-
+-mtk_ghpm_mt6991-y := \
+-	ghpm_mt6991.o \
+-
+-mtk_ghpm_mt6993-y := \
+-	ghpm_mt6993.o \
+-
+-mtk_ghpm_swwa-y := \
+-	ghpm_swwa.o \
+-
+-# ifneq ($(CONFIG_MTK_GPU_LEGACY),y)
+-# ifneq ($(wildcard $(src)/ghpm_mt6991.c),)
+-# obj-$(CONFIG_MTK_GHPM_MT6991_SUPPORT) += mtk_ghpm_mt6991.o
+-# endif
+-# endif
+-
+-# ifneq ($(CONFIG_MTK_GPU_LEGACY),y)
+-# ifneq ($(wildcard $(src)/ghpm_mt6993.c),)
+-# obj-$(CONFIG_MTK_GHPM_MT6993_SUPPORT) += mtk_ghpm_mt6993.o
+-# endif
+-# endif
++    ghpm_compat_510.o
+ 
+-# ifneq ($(CONFIG_MTK_GPU_LEGACY),y)
+-# ifneq ($(wildcard $(src)/ghpm_swwa.c),)
+-# obj-$(CONFIG_MTK_GHPM_MT6991_SUPPORT) += mtk_ghpm_swwa.o
+-# endif
+-# endif
++# GHPM (mt6991/mt6993 only) is intentionally excluded

@@ -469,11 +469,6 @@ KBASE_EXPORT_TEST_API(kbase_pm_get_dvfs_metrics);
 #ifdef CONFIG_MALI_MIDGARD_DVFS
 void kbase_pm_get_dvfs_action(struct kbase_device *kbdev)
 {
-#if !IS_ENABLED(CONFIG_MALI_MTK_COMMON)
-/*
- * kbase_platform_dvfs_event is not implemented by MTK.
- * We used MTKCalGpuUtilization/MTKCalGpuUtilization_ex instead.
- */
 	int utilisation;
 	struct kbasep_pm_metrics *diff;
 
@@ -497,12 +492,11 @@ void kbase_pm_get_dvfs_action(struct kbase_device *kbdev)
 	 * protected mode is already added to busy-time at this point, though,
 	 * so we should be good.
 	 */
-#if IS_ENABLED(CONFIG_MALI_MIDGARD_DVFS) && \
-		IS_ENABLED(CONFIG_MALI_MTK_DVFS_POLICY)
-#else
+	/* MTK normally delegates DVFS to GED, which cannot run here (no
+	 * frame/KPI feed). Hand the utilisation to the platform hook so
+	 * kbase's own DVFS timer drives frequency selection.
+	 */
 	kbase_platform_dvfs_event(kbdev, utilisation);
-#endif /* CONFIG_MALI_MIDGARD_DVFS && CONFIG_MALI_MTK_DVFS_POLICY */
-#endif /* CONFIG_MALI_MTK_COMMON */
 }
 
 #if IS_ENABLED(CONFIG_MALI_MTK_DVFS_POLICY)
