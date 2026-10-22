@@ -107,10 +107,14 @@ void kbase_pm_metrics_start(struct kbase_device *kbdev) {}   // 空实现
 `gpufreq_get_working_table()` 返回 40 个频率档（含签核/老化细档），
 而 `gpufreq_commit()` 只接受粗 OPP 索引。
 
-**修复**：用 `gpufreq_get_opp_num(TARGET_GPU)`（=6）取档数，
-再过滤掉芯片实际不跑的 950MHz，得到 5 档：880/800/610/430/350。
+**修复**：用 `gpufreq_get_opp_num(TARGET_GPU)`（=6）取档数，逐档用
+`gpufreq_get_freq_by_idx(TARGET_GPU, i)` 读频率。
 
-注：`TARGET_DEFAULT` 返回 40，必须用 **`TARGET_GPU`**。
+注：`TARGET_DEFAULT` 返回 40（STACK 域），必须用 **`TARGET_GPU`**。
+
+> 早期为了避开跑不上去的 950MHz，曾经加过 `MTK_GPU_FREQ_CAP_KHZ 880000`
+> 把最高档过滤掉。**这个 cap 后来删掉了**——950MHz 已经被固件补丁解锁
+> （见第 32 节），封顶反而会把可用档位砍掉。
 
 ---
 
@@ -129,16 +133,26 @@ void kbase_pm_metrics_start(struct kbase_device *kbdev) {}   // 空实现
 
 ### 调频策略关键参数
 
-```c
-#define MTK_GPU_MAX_OPP      6          /* 上限保护 */
-#define MTK_GPU_FREQ_CAP_KHZ 880000     /* 屏蔽厂商表里的 950MHz */
+策略是阈值分档，不是 simple_ondemand 的连续换算（早期版本是，后来改成阈值）：
 
-/* simple_ondemand 语义 */
-load = busy * 100 / (busy + idle);
-load = load + (load >> 2);              /* +25% 余量 */
-target_freq = max_freq * load / 100;
-/* 降档需连续 2 次采样, 升档立即生效 */
+```c
+/* util 来自 kbase 的 GPU_ACTIVE 计数器，每 dvfs_period(20ms) 采样一次 */
+if (loading >= 70)      target = 0;   /* 最高档 */
+else if (loading >= 50) target = 1;
+else if (loading >= 30) target = 2;
+else if (loading >= 15) target = 3;
+else                    target = 4;   /* 最低档 */
+
+/* 升频：连续 2 次采样确认后才提交（防止单帧尖峰把 GPU 钉在最高档） */
+/* 降频：先 hold 200ms，再要求连续 1 秒低负载 */
 ```
+
+`mtk_opp_freq[]` / `mtk_opp_index[]` 由 `mtk_opp_table_init()` 从
+`gpufreq_get_opp_num/freq_by_idx(TARGET_GPU)` 动态构建，不再有硬编码上限。
+
+> 注意：`target` 是策略自己的表索引（0..mtk_opp_last），和
+> `gpufreq_get_cur_oppidx()` 返回的 GPU 原始 OPP 索引不是一回事，
+> 比较前必须换算（见第 29 节 bug 3）。
 
 ---
 
@@ -193,8 +207,13 @@ su -c 'dumpsys SurfaceFlinger | grep "GLES: ARM"'
 # 期望: v1.r54p1-11eac0...
 
 su -c 'dmesg | grep mtk-gpufreq'
-# 期望: skipping OPP 0 (950000 kHz) above cap
-#       using 5 entries: 880000/800000/610000/430000/350000
+# 期望（固件补丁后）: using 6 entries，逐档打印
+#   [0] 950000 kHz (gpu idx 0)
+#   [1] 950000 kHz (gpu idx 1)
+#   [2] 800000 kHz (gpu idx 2)
+#   [3] 610000 kHz (gpu idx 3)
+#   [4] 430000 kHz (gpu idx 4)
+#   [5] 350000 kHz (gpu idx 5)
 
 su -c 'dmesg | grep -c "commit .* failed"'      # 期望 0
 su -c 'cat /sys/class/thermal/cooling_device*/max_state'
@@ -801,6 +820,34 @@ GPUEB 是 RISC-V (RV33) 核，固件**未加密、无 hash 校验头**，只有�
 ```
 
 持续满载 60 秒：无 fault、无复位、温度 46-54°C。填充率 18.2-18.7 Gpix/s。
+
+### 打补丁后的完整档位对照
+
+固件表（`/proc/gpufreqv2/gpu_signed_opp_table`，补丁后）：
+
+```
+[00] 950000  78750  78750  posdiv=2
+[01] 950000  78750  78750  posdiv=2    <- 原 880000，被改成 950000
+[02] 800000  72500  75000  posdiv=2
+[03] 610000  65000  75000  posdiv=2
+[04] 430000  60000  75000  posdiv=2
+[05] 350000  57500  75000  posdiv=3
+```
+
+注意 index 0 和 1 现在都是 950MHz（原来 index 0 是固件够不着的 950、index 1 是
+能到顶的 880）。固件选档循环排除 index 0，所以它实际会用 index 1，正好是 950MHz。
+
+kbase 策略表（`mtk_opp_table_init()` 从固件动态构建，索引与上表一一对应）：
+
+```
+mtk_opp_index[] = {0, 1, 2, 3, 4, 5}
+mtk_opp_freq[]  = {950000, 950000, 800000, 610000, 430000, 350000}
+```
+
+**已知遗留**：策略的 `target` 只用到 0..4，所以表里最后一档（index 5 = 350MHz）
+不会被策略主动选中。实测不影响行为——空闲时 GPU 仍会回到 350MHz，因为提交走的是
+`TARGET_DEFAULT`→STACK 域，GPU 频率最终由固件推导。若要策略能显式点到 350MHz，
+把最后那个 `else` 改成 `target = 5;` 即可，但这属于调度逻辑，本次未改动。
 
 ### 实际收益（重要）
 
