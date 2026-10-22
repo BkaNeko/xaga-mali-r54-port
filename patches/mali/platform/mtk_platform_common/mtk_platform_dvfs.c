@@ -458,6 +458,15 @@ static void mtk_opp_table_init(void)
 		f = gpufreq_get_freq_by_idx(TARGET_GPU, i);
 		if (f == 0)
 			break;
+
+		/* The 950 MHz firmware patch rewrote entry 1 so index 0 and 1
+		 * both report 950000. Keep one entry per distinct frequency,
+		 * otherwise the governor wastes a step on two identical OPPs
+		 * and its thresholds no longer line up with the real table.
+		 */
+		if (mtk_opp_last >= 0 && mtk_opp_freq[mtk_opp_last] == (int)f)
+			continue;
+
 		mtk_opp_last++;
 		mtk_opp_freq[mtk_opp_last] = f;
 		mtk_opp_index[mtk_opp_last] = i;
@@ -540,6 +549,41 @@ static void mtk_common_notify_gpu_freq_change(void)
 		mtk_common_rate_change_notify_fp(kbdev, 0, (u32)freq_khz);
 }
 
+/* Map a GPU OPP to the matching STACK OPP by frequency.
+ *
+ * Commits go out as TARGET_DEFAULT, which gpufreq_validate_target() remaps to
+ * TARGET_STACK under dual-buck. Passing the GPU OPP index straight through
+ * therefore indexes the 40-entry STACK table with a 6-entry GPU index -- and
+ * STACK indices 0..5 are all 815..852 MHz, so the firmware linked the GPU to
+ * its top OPP no matter which step the governor asked for. That is why the
+ * GPU only ever showed 950 and 350 MHz and every intermediate step vanished.
+ *
+ * The STACK OPP whose frequency is closest to the requested GPU frequency is
+ * the one that reproduces the old behaviour (Fgpu >= 1.1 * Fstack).
+ */
+static int mtk_stack_idx_for_gpu(int gpu_idx)
+{
+	int gpu_freq, i, best = 0;
+	int best_diff = -1;
+
+	if (mtk_stack_last < 0 || gpu_idx < 0 || gpu_idx > mtk_opp_last)
+		return gpu_idx;
+
+	gpu_freq = mtk_opp_freq[gpu_idx];
+
+	for (i = 0; i <= mtk_stack_last; i++) {
+		int diff = mtk_stack_freq[i] - gpu_freq;
+
+		if (diff < 0)
+			diff = -diff;
+		if (best_diff < 0 || diff < best_diff) {
+			best_diff = diff;
+			best = i;
+		}
+	}
+	return best;
+}
+
 static void mtk_dvfs_apply(unsigned int loading)
 {
 	struct kbase_device *kbdev =
@@ -588,16 +632,23 @@ static void mtk_dvfs_apply(unsigned int loading)
 	 * separate "idle" from "rendering": sustained idle reads 0, any real
 	 * rendering sits well above 40.
 	 */
-	if (loading >= 70)
-		target = 0;	/* 880 MHz */
-	else if (loading >= 50)
-		target = 1;	/* 800 MHz */
-	else if (loading >= 30)
-		target = 2;	/* 610 MHz */
-	else if (loading >= 15)
-		target = 3;	/* 430 MHz */
+	/* Index into mtk_opp_freq[] after de-duplication: 0 = highest.
+	 *
+	 * The top OPP is reserved for genuinely saturated load. With the old
+	 * 70% entry the governor sat at the highest OPP for the whole of any
+	 * sustained workload, which is why only 950 and 350 MHz were ever
+	 * observed -- the middle OPPs never got a chance.
+	 */
+	if (loading >= 90)
+		target = 0;
+	else if (loading >= 70)
+		target = 1;
+	else if (loading >= 45)
+		target = 2;
+	else if (loading >= 20)
+		target = 3;
 	else
-		target = 4;	/* 350 MHz */
+		target = mtk_opp_last;	/* lowest available OPP */
 
 	if (target > mtk_opp_last)
 		target = mtk_opp_last;
@@ -609,7 +660,7 @@ static void mtk_dvfs_apply(unsigned int loading)
 		if (++mtk_up_ticks < 2)
 			return;
 		mtk_up_ticks = 0;
-		mtk_hold_ticks = 10;	/* 200ms at max after ramp */
+		mtk_hold_ticks = 5;	/* 100ms at the new OPP before stepping down */
 		mtk_down_ticks = 0;
 	} else if (target > cur_idx) {
 		mtk_up_ticks = 0;
@@ -617,7 +668,13 @@ static void mtk_dvfs_apply(unsigned int loading)
 			mtk_hold_ticks--;
 			return;
 		}
-		if (++mtk_down_ticks < 50)	/* 1s of sustained idle */
+		/* Step down one OPP at a time after a short confirmation window.
+		 * The old value (50 ticks = 1s) was far longer than the 40ms the
+		 * ramp-up needs, so once the governor reached the top OPP it
+		 * stayed there through every brief dip and the intermediate OPPs
+		 * were never selected in practice.
+		 */
+		if (++mtk_down_ticks < 8)	/* 160ms */
 			return;
 	} else {
 		mtk_down_ticks = 0;
@@ -628,6 +685,7 @@ static void mtk_dvfs_apply(unsigned int loading)
 
 	if (target != cur_idx) {
 		int gpu_idx = mtk_opp_index[target];
+		int stack_idx = mtk_stack_idx_for_gpu(target);
 		/* Submit exactly like the stock driver: one TARGET_DEFAULT commit
 		 * with the GPU OPP index. With gpueb enabled the request is
 		 * forwarded to the firmware, which only honours the STACK-domain
@@ -635,12 +693,12 @@ static void mtk_dvfs_apply(unsigned int loading)
 		 * The gpufreq backend then derives the STACK OPP itself under
 		 * Fgpu >= 1.1 * Fstack, so a second commit would undo that.
 		 */
-		int ret = gpufreq_commit(TARGET_DEFAULT, gpu_idx);
+		int ret = gpufreq_commit(TARGET_DEFAULT, stack_idx);
 
 		mtk_down_ticks = 0;
 		pr_info_ratelimited(
-			"GDBG commit: %d->%d gpu_idx=%d ret=%d\n",
-			cur_idx, target, gpu_idx, ret);
+			"GDBG commit: %d->%d stack_idx=%d gpu_idx=%d ret=%d\n",
+			cur_idx, target, stack_idx, gpu_idx, ret);
 	}
 
 }
