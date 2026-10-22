@@ -36,8 +36,8 @@ mali_csffw.bin    (firmware)   ─┘
 | GLES | `v1.r54p1-11eac0` |
 | Vulkan | 驱动 1.3.305，特性声明已修正为 1.3 |
 | 填充率 | 14.1 → **18.2~18.7 Gpix/s** |
-| GPU 最高频率 | 880 → **950 MHz**（固件补丁，硬件频率计实测）|
-| 3DMark Wild Life | 原厂 ~6000 → **5739**（96%，950 MHz 修复前）|
+| GPU 最高频率 | 880 → **950 MHz**（固件补丁，FmeterFreq 950015 实测）|
+| 3DMark Wild Life | 原厂 ~6000 → 5730（880 MHz）→ **5814**（950 MHz）|
 | 系统 | 正常启动，无致命错误 |
 
 ---
@@ -272,6 +272,10 @@ fastboot flash gpueb_b firmware/gpueb_950mhz.bin
 ```
 
 持续满载 60 秒无 fault、无复位，温度 46-54°C。详见 [firmware/README.md](firmware/README.md)。
+
+**实际收益**：3DMark Wild Life 5730 → 5814（+1.5%），而 GPU 核心频率是 +8%。
+中间差掉的 6.5% 说明这个负载下瓶颈不在核心频率——填充率、内存带宽或散热先行触顶。
+核心频率上去了但分数没同比例涨，这类情况很常见，记录在这里以免高估收益。
 
 ## 已知限制
 
