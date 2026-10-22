@@ -574,3 +574,223 @@ lib64/egl/mt6895/libGLES_mali.so     51.7MB  r54 用户态
 etc/permissions/android.hardware.vulkan.version.xml        Vulkan 1.3
 etc/permissions/android.software.vulkan.deqp.level.xml     2025-03-01
 ```
+
+---
+
+# 第四部分：DVFS 调试实录（五层假象）
+
+这一节记录调频从"完全不工作"到"稳定工作"的全过程。每个 bug 都表现为
+"函数返回成功但什么也没发生"，光看返回值发现不了。
+
+## 28. 五个层层嵌套的 bug
+
+| # | 问题 | 症状 | 根因 | 定位方法 |
+|---|---|---|---|---|
+| 1 | 利用率分母单位错 | util 恒假 | `time_busy` 是 256ns 单位，被当 ns 除 | 读 kbase debugfs 的计数器 |
+| 2 | `cur_gpu_rate` 不同步 | util 虚高 86% | 只在 commit 成功时更新，失败就卡在旧值 | 对比 kbase 计数器与 GED |
+| 3 | **索引坐标系错位** | `cur` 永远读 5 | GPU 原始索引 1-5 vs 表索引 0-4 | 发现 `cur` 与提交值对不上 |
+| 4 | **提交路径用 TARGET_GPU** | `ret=0` 但不生效 | gpueb 模式下 `TARGET_GPU` 只发消息，固件不认 | `fix_target_opp_index` 对照实验 |
+| 5 | 数组越界 / 隐式声明 | 日志垃圾 / 类型风险 | 打印 `[5]` 但只有 5 档 | 编译器警告 |
+
+## 29. 逐条详解
+
+### bug 1：`time_busy` 的单位是 256ns
+
+```c
+// mali_kbase_pm_metrics.c
+#define KBASE_PM_TIME_SHIFT 8
+ns_time = (u32)(diff_ns >> KBASE_PM_TIME_SHIFT);   // 256ns 单位
+values.time_busy[i] += gpu_active_counter[i];      // 同样是 256ns 单位
+```
+
+两者同单位，比值天然有界。**绝不能混入墙钟当分母**——我一度加了
+`delta_time = 墙钟us * 1000`，结果分子是 256ns、分母是 1ns，差 256 倍。
+
+正确写法：
+
+```c
+delta_time = max(diff->time_busy[0] + diff->time_idle[0], 1u);
+utilisation[index] = (100 * diff->time_busy[index]) / delta_time;
+```
+
+### bug 2：`cur_gpu_rate` 只在特定时机更新
+
+```c
+// ipa_control.c
+delta_value = div_u64(delta_value, kbdev->csf.ipa_control.cur_gpu_rate);
+```
+
+`cur_gpu_rate` 只在 commit 成功通知时更新。一旦某次 commit 失败，它就卡在
+低频值上 → 实际 880MHz 按 350MHz 折算 → busy 时间放大 2.5× →
+被 `MIN(..., ns_time)` 封顶 → util 钉死在 86~100%。
+
+修法：每个 tick 用官方接口刷新
+
+```c
+if (!IS_ERR_OR_NULL(kbdev))
+    mtk_common_notify_gpu_freq_change();
+```
+
+注意 `kbase_ipa_control_rate_change_notify_ex()` **内部会乘 1000**，所以传 kHz。
+
+### bug 3：两个索引空间错开一位
+
+```c
+cur_idx = gpufreq_get_cur_oppidx(TARGET_GPU);   // 返回 GPU 原始索引：1..5
+target  = 0/1/2/3/4;                            // 我们表索引：0..4
+if (target < cur_idx) { ... }                   // 永远判为"要升频"
+```
+
+必须换算到同一坐标系：
+
+```c
+cur_idx = mtk_opp_last;
+for (i = 0; i <= mtk_opp_last; i++)
+    if (mtk_opp_index[i] == raw_idx) { cur_idx = i; break; }
+```
+
+### bug 4：`TARGET_GPU` 在 gpueb 模式下无效
+
+```c
+// gpufreq_v2.c
+if (g_gpueb_support) {
+    send_msg.u.oppidx = oppidx;
+    if (!gpufreq_ipi_to_gpueb(send_msg))
+        ret = g_recv_msg.u.return_value;   // 只是"消息送达"
+    goto done;                              // 跳过 AP 路径
+}
+```
+
+**`ret=0` 只表示消息发出去了，不代表频率变了。** 原厂用 `TARGET_DEFAULT`。
+
+对照实验（这是关键手法）：
+
+```bash
+# 手动接口走 TARGET_DEFAULT，能立刻生效
+echo 1 > /proc/gpufreqv2/fix_target_opp_index
+# → GPU Index 1, 880MHz  ✓
+
+# 我们的策略走 TARGET_GPU，ret=0 但不变
+```
+
+## 30. `/proc` 输出的坑
+
+`/proc/gpufreqv2/gpu_working_opp_table` **会打印一行越界数据**：
+
+```c
+// gpufreq_debug.c
+opp_table = gpufreq_get_working_table(TARGET_GPU);  // 真实表
+opp_num = g_debug_gpu.opp_num;                      // 可能比真实表大
+for (i = 0; i < opp_num; i++)
+    seq_printf(m, ..., opp_table[i].freq, ...);      // 越界
+```
+
+**判断档数要用 `gpufreq_status` 的 `WorkingOPPNum`，不要数 `/proc` 表行数。**
+
+## 31. gpueb 模式下 OPP 表来自固件
+
+```c
+// gpufreq_get_freq_by_idx
+if (g_gpueb_support) {
+    send_msg.u.oppidx = oppidx;
+    if (!gpufreq_ipi_to_gpueb(send_msg))
+        freq = g_recv_msg.u.freq;    // ← 固件返回
+    goto done;
+}
+```
+
+**`gpueb: on` 时本地静态表 `g_default_gpu[]` 完全不参与**，所有 OPP 数据从
+固件 IPI 拿。所以：
+
+- 读源码表推断运行时行为 → 错误
+- 必须读 `/proc/gpufreqv2/` 或 `gpufreq_status`
+
+## 32. 950MHz 的真相
+
+固件表里有 6 档（`WorkingOPPNum: 6`），最高 950MHz（index 0）：
+
+```
+[00] freq: 950000, volt: 78750, vsram: 78750, posdiv: 2
+[01] freq: 880000, volt: 78750, vsram: 75000, posdiv: 2
+```
+
+但实测**请求 index 0 一律返回 index 1（880MHz）**：
+
+```bash
+echo 0 > /proc/gpufreqv2/fix_target_opp_index
+# → GPU-OPP: Index 1, Freq 880000（无论满载还是空闲）
+```
+
+对照：同款 MT6895 的 **mainline 内核**能跑出 core 950MHz + stack 852MHz，
+说明硬件本身支持（PLL 能出 950，posdiv=2 正确）。
+
+**限制来自 GPUEB 固件的策略**，官方 DDK 不开放这一档。用户空间与内核都
+没有绕过路径：`fix_custom_freq_volt` 接口直接被禁用。
+
+STACK 域 852MHz 是能跑到的（`STACK-OPP: Index 0, Freq 852000` 实测确认）。
+
+## 33. 调频最终配置
+
+```
+kbase 内置 DVFS（唯一决策源）
+    dvfs_callback (hrtimer, 20ms)
+      → kbase_pm_get_dvfs_action
+        → kbase_platform_dvfs_event
+          → mtk_dvfs_apply
+            → gpufreq_commit(TARGET_DEFAULT, gpu_idx)
+              → GPUEB 固件（自动联动 STACK，Fgpu ≥ 1.1 × Fstack）
+
+五档映射：
+  util ≥ 70%  → 880MHz (idx 0)
+  util ≥ 50%  → 800MHz (idx 1)
+  util ≥ 30%  → 610MHz (idx 2)
+  util ≥ 15%  → 430MHz (idx 3)
+  其余        → 350MHz (idx 4)
+
+升频：连续 2 次采样确认
+降频：保持 200ms + 连续 1 秒低负载
+```
+
+验证结果：
+
+```
+空闲: 5 5 5 5 5 5（6/6 稳定）
+提交: 100 次全部 ret=0
+满载: GPU Index 1 (880MHz), STACK Index 0 (852MHz)
+```
+
+## 34. 3DMark 分数腰斩的真实原因
+
+修复调频后跑出 2923 分（之前 5730）。排查结论：**与 GPU 调频无关**。
+
+```
+20:00  5730分   大核稳定 2850MHz
+20:43  2923分   大核掉到 500MHz，小核 450MHz
+```
+
+3DMark 的物理模拟严重依赖 CPU。实测 CPU 频率随温度剧烈波动：
+
+```
+76°C → cpu4 400MHz
+65°C → cpu4 2000MHz
+64°C → cpu4 2850MHz
+```
+
+**这是正常的热管理，不是 bug。** 跑分前需降温到 <35°C 并关闭后台应用。
+
+同时排除：GPU 填充率正常（15-19 Gpix/s）、STACK 联动正常、无 GPU fault/hang。
+
+## 35. 一条方法论
+
+在闭源固件参与的路径上，**"照抄原厂"比"按直觉重构"可靠**。
+
+我一开始认为"提交 GPU 域更直觉、更正确"，还专门写注释论证，结果
+`TARGET_GPU` 根本不被固件接受。原厂用 `TARGET_DEFAULT` 是有原因的。
+
+判断依据应该是**实测**，不是源码看起来对不对：
+
+```bash
+# 对照实验：直接改硬件 vs 走驱动路径
+echo 1 > /proc/gpufreqv2/fix_target_opp_index   # 直接
+# 对比 dmesg 里策略提交的结果
+```

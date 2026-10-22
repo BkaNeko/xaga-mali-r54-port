@@ -193,8 +193,8 @@ kbase 内置 DVFS（唯一决策源）
       → kbase_pm_get_dvfs_action (算利用率)
         → kbase_platform_dvfs_event (官方平台钩子)
           → 选档 + 提交
-            → gpufreq_commit(TARGET_DEFAULT)
-              → 双 buck 映射 → GPUEB 固件 → GPU 域 + STACK 域
+            → gpufreq_commit(TARGET_DEFAULT, gpu_idx)
+              → GPUEB 固件 → 自动联动 STACK（Fgpu >= 1.1 * Fstack）
 ```
 
 策略参数（实测调优）：
@@ -202,8 +202,44 @@ kbase 内置 DVFS（唯一决策源）
 ```
 升频：连续 2 次采样超阈值（约 40ms 确认）
 降频：保持 200ms + 连续 1 秒低负载才降一档
-阈值：≥55% → 880MHz | ≥35% → 800MHz | ≥18% → 610MHz | ≥6% → 430MHz | 其余 350MHz
+阈值：>=70% → 880MHz | >=50% → 800MHz | >=30% → 610MHz | >=15% → 430MHz | 其余 350MHz
 ```
+
+### 调频踩过的五个假象
+
+每个 bug 都表现为"返回成功但什么也没发生"，光看返回值发现不了。
+
+| # | 问题 | 症状 |
+|---|---|---|
+| 1 | `time_busy` 是 256ns 单位，被当 ns 除 | util 恒假（差 256×） |
+| 2 | `cur_gpu_rate` 只在 commit 成功时更新 | util 虚高 86% |
+| 3 | **索引坐标系错位**（GPU 原始 1-5 vs 表 0-4）| `cur` 永远读 5 |
+| 4 | **`TARGET_GPU` 提交在 gpueb 模式下无效** | `ret=0` 但频率不变 |
+| 5 | 打印 `mtk_opp_freq[5]` 但只有 5 档 | 启动日志垃圾数据 |
+
+详见 [docs/PORTING.zh-CN.md](docs/PORTING.zh-CN.md) 第四部分。
+
+### gpueb 模式下 OPP 表来自固件
+
+```c
+// gpufreq_get_freq_by_idx
+if (g_gpueb_support) {
+    if (!gpufreq_ipi_to_gpueb(send_msg))
+        freq = g_recv_msg.u.freq;    // ← 固件返回，本地静态表不参与
+    goto done;
+}
+```
+
+**判断档数必须读 `gpufreq_status` 的 `WorkingOPPNum`**，不要数
+`/proc/gpufreqv2/gpu_working_opp_table` 的行数——那个接口会打印一行越界数据。
+
+### 950MHz 不可用
+
+固件表里有 6 档（`WorkingOPPNum: 6`），最高 950MHz 在 index 0。但实测请求
+index 0 一律返回 index 1（880MHz），固件层限制，无绕过路径。
+
+同款 MT6895 的 mainline 内核能跑到 core 950MHz，说明硬件本身支持，
+限制来自 MTK 的 GPUEB 固件策略。STACK 域 852MHz 可以正常达到。
 
 ---
 

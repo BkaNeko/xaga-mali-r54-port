@@ -398,11 +398,14 @@ int mtk_common_gpufreq_bringup(void)
 
 u32 mtk_common_get_current_rate_hz(void)
 {
-#if IS_ENABLED(CONFIG_MALI_MIDGARD_DVFS) && IS_ENABLED(CONFIG_MALI_MTK_DVFS_POLICY)
-	/* start the utilisation governor on first GPU activity */
-	mtk_dvfs_policy_start();
-#endif
-	return (u32)gpufreq_get_cur_freq(TARGET_DEFAULT) * 1000;
+	/* Pure read: this is called from calc_prfcnt_delta() with the IPA
+	 * control spinlock held, so it must not start work or take other locks.
+	 * The governor is started from mtk_dvfs_init() instead.
+	 *
+	 * Report the GPU domain: the counters are scaled by the GPU core clock.
+	 * Under dual-buck, TARGET_DEFAULT resolves to STACK (219..845 MHz).
+	 */
+	return (u32)gpufreq_get_cur_freq(TARGET_GPU) * 1000;
 }
 EXPORT_SYMBOL(mtk_common_get_current_rate_hz);
 

@@ -185,6 +185,11 @@ void mtk_common_cal_gpu_utilization(unsigned int *pui32Loading,
 	kbase_pm_get_dvfs_metrics(kbdev, &kbdev->pm.backend.metrics.dvfs_last,
 				  diff);
 
+	/* time_busy and time_idle share the same unit (1 << KBASE_PM_TIME_SHIFT
+	 * ns) and sum to the elapsed window, so their ratio is the honest duty
+	 * cycle. Never mix them with a wall-clock denominator: the hrtimer
+	 * runs continuously, and a mismatched unit skews the result 256x.
+	 */
 	delta_time = max(diff->time_busy[0] + diff->time_idle[0], 1u);
 	for (index = 0; index < NUM_PERF_COUNTERS; index++) {
 		// delta time should be the same for all PMU, so simply reuse it
@@ -280,6 +285,14 @@ void mtk_set_gpu_idle_time(unsigned int val){
 }
 
 #if IS_ENABLED(CONFIG_MALI_MIDGARD_DVFS) && IS_ENABLED(CONFIG_MALI_MTK_DVFS_POLICY)
+#if !IS_ENABLED(CONFIG_MALI_DEVFREQ)
+/* mali_kbase_pm_internal.h declares this only under CONFIG_MALI_DEVFREQ, but
+ * mali_kbase_pm_ca.c provides an equivalent implementation in the #else
+ * branch. Declare it here so the call is type-checked.
+ */
+void kbase_devfreq_set_core_mask(struct kbase_device *kbdev, u64 core_mask);
+#endif
+
 int mtk_set_core_mask(u64 core_mask)
 {
 	struct kbase_device *kbdev = (struct kbase_device *)mtk_common_get_kbdev();
@@ -397,11 +410,7 @@ int mtk_dvfs_procfs_term(struct kbase_device *kbdev, struct proc_dir_entry *pare
  * only accepts the coarse OPP indices (0..5 on mt6895: 950/880/800/610/430/350MHz).
  * The exact count is only exposed by gpufreq_get_debug_opp_info(), which is not
  * exported, so cap at the OPP count of this SoC. */
-#define MTK_GPU_MAX_OPP 6
-/* xaga/mt6895: the vendor gpufreq table exposes a 950 MHz entry that this
- * chip never runs at (it belongs to the signed/aging table).  Drop any OPP
- * above this cap so the governor cannot select it. */
-#define MTK_GPU_FREQ_CAP_KHZ 880000
+#define MTK_GPU_MAX_OPP 5
 
 static struct delayed_work mtk_dvfs_policy_work;
 static bool mtk_dvfs_policy_running;
@@ -416,6 +425,7 @@ static int mtk_down_ticks;
 static int mtk_hold_ticks;
 static int mtk_up_ticks;
 static bool mtk_runtime_tuned;
+
 
 /* GED's own DVFS engine does not raise the GPU OPP on this platform (it only
  * tracks the STACK domain), so this policy is the one that actually scales the
@@ -448,11 +458,6 @@ static void mtk_opp_table_init(void)
 		f = gpufreq_get_freq_by_idx(TARGET_GPU, i);
 		if (f == 0)
 			break;
-		if (f > MTK_GPU_FREQ_CAP_KHZ) {
-			pr_info("mtk-gpufreq: skipping OPP %d (%u kHz) above cap\n",
-				i, f);
-			continue;
-		}
 		mtk_opp_last++;
 		mtk_opp_freq[mtk_opp_last] = f;
 		mtk_opp_index[mtk_opp_last] = i;
@@ -460,12 +465,12 @@ static void mtk_opp_table_init(void)
 
 	mtk_opp_max_freq = (mtk_opp_last >= 0) ? mtk_opp_freq[0] : 0;
 
-	pr_info("mtk-gpufreq: opp_num gpu=%d def=%d, using %d entries: %d/%d/%d/%d/%d/%d kHz (idx %d/%d/%d/%d/%d/%d)\n",
-		num_gpu, num_def, mtk_opp_last + 1,
-		mtk_opp_freq[0], mtk_opp_freq[1], mtk_opp_freq[2],
-		mtk_opp_freq[3], mtk_opp_freq[4], mtk_opp_freq[5],
-		mtk_opp_index[0], mtk_opp_index[1], mtk_opp_index[2],
-		mtk_opp_index[3], mtk_opp_index[4], mtk_opp_index[5]);
+
+	pr_info("mtk-gpufreq: opp_num gpu=%d def=%d, using %d entries\n",
+		num_gpu, num_def, mtk_opp_last + 1);
+	for (i = 0; i <= mtk_opp_last; i++)
+		pr_info("mtk-gpufreq:   [%d] %u kHz (gpu idx %d)\n",
+			i, mtk_opp_freq[i], mtk_opp_index[i]);
 
 	/* stack (SLC/system-cache) domain: separate fine-grained table */
 	{
@@ -517,11 +522,57 @@ static void __maybe_unused mtk_stack_track(int gpu_freq_khz)
  * timer (kbase_platform_dvfs_event) so the built-in mechanism drives
  * frequency selection instead of a private workqueue.
  */
+
+/* Push the current GPU clock into the IPA layer through its official
+ * listener: kbase_ipa_control_rate_change_notify_ex() multiplies by 1000, so
+ * this takes kHz (which is what gpufreq returns) and yields Hz internally.
+ */
+static void mtk_common_notify_gpu_freq_change(void)
+{
+	struct kbase_device *kbdev = (struct kbase_device *)mtk_common_get_kbdev();
+	int freq_khz;
+
+	if (IS_ERR_OR_NULL(kbdev) || !mtk_common_rate_change_notify_fp)
+		return;
+
+	freq_khz = gpufreq_get_cur_freq(TARGET_GPU);
+	if (freq_khz > 0)
+		mtk_common_rate_change_notify_fp(kbdev, 0, (u32)freq_khz);
+}
+
 static void mtk_dvfs_apply(unsigned int loading)
 {
-	int cur_idx, target = -1;
+	struct kbase_device *kbdev =
+		(struct kbase_device *)mtk_common_get_kbdev();
+	int cur_idx, target = -1, raw_idx, i;
 
-	cur_idx = gpufreq_get_cur_oppidx(TARGET_GPU);
+	raw_idx = gpufreq_get_cur_oppidx(TARGET_GPU);
+	if (raw_idx < 0)
+		return;	/* shared status not ready; -1 would invert every compare */
+
+	/* gpufreq reports the raw GPU OPP index (1..5 here), while target is an
+	 * index into our own table (0..mtk_opp_last). Convert before comparing,
+	 * otherwise the policy believes it is one step higher than it really is
+	 * and never ramps up.
+	 */
+	cur_idx = mtk_opp_last;
+	for (i = 0; i <= mtk_opp_last; i++)
+		if (mtk_opp_index[i] == raw_idx) {
+			cur_idx = i;
+			break;
+		}
+
+	/* Refresh the rate used to convert GPU_ACTIVE cycles into time. It is
+	 * only updated on a successful commit notification, so a missed one
+	 * leaves it at an old (lower) clock and the busy time is scaled up
+	 * until it saturates the window. Refresh every tick as a safety net;
+	 * the helper takes kHz and converts to Hz itself.
+	 */
+	if (!IS_ERR_OR_NULL(kbdev))
+		mtk_common_notify_gpu_freq_change();
+
+	pr_info_ratelimited("GDBG: util=%u cur=%d up=%d hold=%d down=%d\n",
+		loading, cur_idx, mtk_up_ticks, mtk_hold_ticks, mtk_down_ticks);
 
 	/* If GED committed a frequency recently it is driving DVFS itself;
 	 * stay out of the way (official MTK behaviour). */
@@ -532,24 +583,29 @@ static void mtk_dvfs_apply(unsigned int loading)
 	/* Performance-first policy modelled on MTK GED behaviour: ramp up
 	 * eagerly and hold the higher OPP for a few ticks before allowing a
 	 * downscale, so short idle gaps do not cause frequency flapping. */
-	if (loading >= 55)
-		target = 0;
-	else if (loading >= 35)
-		target = 1;
-	else if (loading >= 18)
-		target = 2;
-	else if (loading >= 6)
-		target = 3;
+	/* Utilisation now comes from the real GPU_ACTIVE counter and fluctuates
+	 * frame to frame, so the thresholds are placed where they actually
+	 * separate "idle" from "rendering": sustained idle reads 0, any real
+	 * rendering sits well above 40.
+	 */
+	if (loading >= 70)
+		target = 0;	/* 880 MHz */
+	else if (loading >= 50)
+		target = 1;	/* 800 MHz */
+	else if (loading >= 30)
+		target = 2;	/* 610 MHz */
+	else if (loading >= 15)
+		target = 3;	/* 430 MHz */
 	else
-		target = 4;
+		target = 4;	/* 350 MHz */
 
 	if (target > mtk_opp_last)
 		target = mtk_opp_last;
 
 	if (target < cur_idx) {
-		/* Require two consecutive samples before ramping: a single
-		 * spike (e.g. one composited frame) must not pull the GPU to
-		 * the top OPP, otherwise it idles at max frequency. */
+		/* Two consecutive samples before ramping keeps single-frame
+		 * spikes from pinning the GPU at max, without making the ramp
+		 * miss when utilisation hovers around a threshold. */
 		if (++mtk_up_ticks < 2)
 			return;
 		mtk_up_ticks = 0;
@@ -571,13 +627,20 @@ static void mtk_dvfs_apply(unsigned int loading)
 	}
 
 	if (target != cur_idx) {
-		int ret = mtk_common_gpufreq_commit(mtk_opp_index[target]);
+		int gpu_idx = mtk_opp_index[target];
+		/* Submit exactly like the stock driver: one TARGET_DEFAULT commit
+		 * with the GPU OPP index. With gpueb enabled the request is
+		 * forwarded to the firmware, which only honours the STACK-domain
+		 * form; a TARGET_GPU commit returns success but changes nothing.
+		 * The gpufreq backend then derives the STACK OPP itself under
+		 * Fgpu >= 1.1 * Fstack, so a second commit would undo that.
+		 */
+		int ret = gpufreq_commit(TARGET_DEFAULT, gpu_idx);
 
 		mtk_down_ticks = 0;
-		if (ret)
-			pr_info_ratelimited(
-				"mtk-gpufreq: commit %d->%d(idx %d) failed ret=%d\n",
-				cur_idx, target, mtk_opp_index[target], ret);
+		pr_info_ratelimited(
+			"GDBG commit: %d->%d gpu_idx=%d ret=%d\n",
+			cur_idx, target, gpu_idx, ret);
 	}
 
 }
@@ -585,11 +648,6 @@ static void mtk_dvfs_apply(unsigned int loading)
 static void mtk_dvfs_policy_fn(struct work_struct *work)
 {
 	struct kbase_device *kbdev = (struct kbase_device *)mtk_common_get_kbdev();
-	unsigned int loading = 0, block = 0, idle = 0;
-	int cur_idx, target = -1;
-#if IS_ENABLED(CONFIG_MALI_MTK_DVFS_LOADING_MODE)
-	struct GpuUtilization_Ex util_ex;
-#endif
 
 	if (IS_ERR_OR_NULL(kbdev))
 		goto out;
@@ -620,14 +678,9 @@ static void mtk_dvfs_policy_fn(struct work_struct *work)
 		pr_info("mtk-gpufreq: runtime tune applied (hysteresis 10ms, dvfs 20ms)\n");
 	}
 
-#if IS_ENABLED(CONFIG_MALI_MTK_DVFS_LOADING_MODE)
-	memset(&util_ex, 0, sizeof(util_ex));
-	mtk_common_cal_gpu_utilization_ex(&loading, &block, &idle, &util_ex);
-#else
-	mtk_common_cal_gpu_utilization(&loading, &block, &idle);
-#endif
-
-
+	/* Frequency arbitration lives in kbase_platform_dvfs_event(), driven by
+	 * kbase's own DVFS hrtimer. This work only does one-time setup.
+	 */
 
 out:
 	if (mtk_dvfs_policy_running)
