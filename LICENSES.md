@@ -1,6 +1,6 @@
 # 许可
 
-本仓库包含两部分，许可不同：
+本仓库包含三部分，许可不同：
 
 ## 补丁（GPL-2.0）
 
@@ -14,6 +14,30 @@ patches/
 （ARM 以 GPL-2.0 发布的 MTK 平台部分）的修改。派生作品同样受 GPL-2.0 约束。
 
 完整许可证文本见 <https://www.gnu.org/licenses/old-licenses/gpl-2.0.html>。
+
+## 固件（专有，不属于本仓库许可范围）
+
+```
+firmware/
+  mali_csffw.bin      ARM Mali CSF 固件（ARM Ltd. 专有）
+  gpueb_stock.bin     MediaTek GPUEB 协处理器固件（MediaTek Inc. 专有）
+  gpueb_950mhz.bin    同上，由 gpueb_patch.py 修改 5 个字节生成
+```
+
+这些是厂商的二进制固件，**不是开源代码**，不适用本仓库的 GPL-2.0 / MIT 许可。
+收录目的仅为记录移植工作所需的配对版本、以及使 950 MHz 补丁可复现与可回滚。
+
+重新分发前请自行确认 ARM 与 MediaTek 的授权条款。若你只关心源码层面的改动，
+可以删除整个 `firmware/` 目录，仓库其余部分不受影响。
+
+## 工具（MIT）
+
+```
+tools/
+```
+
+`gpueb_patch.py`、`glbench.c`、`vkprobe.c`、`gedboot.c`、`gedvsyncd.c`、
+`gtprobe.c`、`payload_extract.py` 为本次移植工作新写的工具，以 MIT 许可发布。
 
 具体来说，以下文件源自 MediaTek 的 GPL-2.0 代码，其版权归 MediaTek Inc. 所有：
 

@@ -705,29 +705,107 @@ if (g_gpueb_support) {
 - 读源码表推断运行时行为 → 错误
 - 必须读 `/proc/gpufreqv2/` 或 `gpufreq_status`
 
-## 32. 950MHz 的真相
+## 32. 950MHz 跑不起来的真正原因（已修复）
 
-固件表里有 6 档（`WorkingOPPNum: 6`），最高 950MHz（index 0）：
+固件表里有 6 档（`WorkingOPPNum: 6`），最高 950MHz 在 index 0：
 
 ```
 [00] freq: 950000, volt: 78750, vsram: 78750, posdiv: 2
 [01] freq: 880000, volt: 78750, vsram: 75000, posdiv: 2
+[02] freq: 800000, ...
 ```
 
-但实测**请求 index 0 一律返回 index 1（880MHz）**：
+实测：满载时 GPU 永远最高只到 `Index 1`（880MHz），950MHz 从不出现。
 
-```bash
-echo 0 > /proc/gpufreqv2/fix_target_opp_index
-# → GPU-OPP: Index 1, Freq 880000（无论满载还是空闲）
+### 根因：选档循环的边界是 `i > 0`
+
+GPUEB 固件里的 GPU OPP 表在偏移 `0x15d60`（6 项，每项 24 字节，
+与 AP 侧 `struct gpufreq_opp_info` 布局一致）。选档循环写成：
+
+```c
+/*
+ * Fstack <= 800MHz: find Fgpu >= Fstack*1.1
+ * Fstack > 800Mhz: Fgpu = 880MHz (OPP[0])     <- 880 曾是最高的 OPP[0]
+ */
+for (i = min_oppidx; i > 0; i--) {             <- 边界没随 6 档表更新
+    target_freq = working_table[i].freq * GPUFREQ_BASE_COEF;
+    if (target_freq >= fstack * GPUFREQ_CONSTRAINT_COEF)
+        break;
+}
 ```
 
-对照：同款 MT6895 的 **mainline 内核**能跑出 core 950MHz + stack 852MHz，
-说明硬件本身支持（PLL 能出 950，posdiv=2 正确）。
+这段逻辑写的时候表只有 5 档、880MHz 在 index 0。后来 950MHz 插到 index 0，
+**循环边界 `i > 0` 没跟着改，index 0 被永久排除**。
 
-**限制来自 GPUEB 固件的策略**，官方 DDK 不开放这一档。用户空间与内核都
-没有绕过路径：`fix_custom_freq_volt` 接口直接被禁用。
+数学佐证：STACK 最高 852MHz，按 MTK 自己的约束 `Fgpu >= Fstack*1.1`，
+GPU 至少要 937.2MHz。实际给的是 880MHz —— **连自己的约束都违反了**，
+说明 880 不是「最优选择」而是「被截断后的错误结果」。950MHz 恰好满足约束。
 
-STACK 域 852MHz 是能跑到的（`STACK-OPP: Index 0, Freq 852000` 实测确认）。
+### AP 侧为什么绕不过去（三条路都堵死，实测验证）
+
+**1. `gpufreq_commit(TARGET_GPU, idx)` 无效**
+
+`tools/gtprobe.c` 是专为此写的内核探针模块，直接调用导出的 `gpufreq_commit()`：
+
+```
+commit(target=TARGET_GPU, idx=0) ret=0 -> cur_idx=1 freq=880000
+commit(target=TARGET_GPU, idx=1..5) ret=0 -> 频率完全不动
+```
+
+**返回 0 只代表 IPI 消息送达，固件只认真 `TARGET_STACK`。**
+
+**2. 所有用户空间写接口都落在 STACK 域**
+
+`gpufreq_validate_target()` 在 dual-buck 下重映射：
+
+```c
+if (*target == TARGET_DEFAULT) {
+    if (g_dual_buck) *target = TARGET_STACK;
+    else             *target = TARGET_GPU;
+}
+```
+
+而 `/proc/gpufreqv2/` 里**所有**写接口（`fix_target_opp_index`、
+`fix_custom_freq_volt`、`set_limit`、`switch_limit`）用的都是 `TARGET_DEFAULT`。
+写 950000 直接报错：
+
+```
+[GPU/FREQ][ERROR]@gpufreq_fix_custom_freq_volt: fail to fix STACK freq: 950000 (-1)
+```
+
+**3. EB 模式下 AP 侧策略是空壳**
+
+```c
+static struct gpuppm_platform_fp platform_eb_fp = {};   /* 全空 */
+```
+
+一行都不执行，全部交给固件。
+
+### 修复：改固件表
+
+GPUEB 是 RISC-V (RV33) 核，固件**未加密、无 hash 校验头**，只有约 96KB 实际代码。
+把 entry[1] 从 880 改成 950：
+
+```
+0x15d78: 80 6d 0d 00  ->  f0 7e 0e 00    (880000 -> 950000)
+0x15d80: f8 24 00 00  ->  9e 33 00 00    (75000 -> 78750)
+```
+
+共 5 字节。详见 [firmware/README.md](../firmware/README.md)。
+
+### 验证结果
+
+```
+[GPU-OPP]     Index: 1, Freq: 950000
+[GPU-REALOPP] FmeterFreq: 950015      <- 硬件频率计实测，非软件上报
+```
+
+持续满载 60 秒：无 fault、无复位、温度 46-54°C。填充率 18.2-18.7 Gpix/s。
+
+### 对照：为什么 mainline 能跑 950
+
+mainline 用 panthor 直接驱动 GPU 的 clk/regulator，**不经过 MTK 的 gpufreq，
+也不经过 GPUEB 的选档逻辑**，所以能直接设到 950MHz。
 
 ## 33. 调频最终配置
 

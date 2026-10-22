@@ -35,8 +35,9 @@ mali_csffw.bin    (firmware)   ─┘
 | gpueb | 6.12 backport，probe 正常，导出符号 56 → 73 |
 | GLES | `v1.r54p1-11eac0` |
 | Vulkan | 驱动 1.3.305，特性声明已修正为 1.3 |
-| 填充率 | 14.1 → **17~18 Gpix/s** |
-| 3DMark Wild Life | 原厂 ~6000 → **5739**（96%）|
+| 填充率 | 14.1 → **18.2~18.7 Gpix/s** |
+| GPU 最高频率 | 880 → **950 MHz**（固件补丁，硬件频率计实测）|
+| 3DMark Wild Life | 原厂 ~6000 → **5739**（96%，950 MHz 修复前）|
 | 系统 | 正常启动，无致命错误 |
 
 ---
@@ -44,6 +45,11 @@ mali_csffw.bin    (firmware)   ─┘
 ## 仓库结构
 
 ```
+firmware/
+  mali_csffw.bin                  Mali CSF 固件 UK 1.38（ARM 专有）
+  gpueb_stock.bin                 GPUEB 原厂固件（GPU 最高 880 MHz）
+  gpueb_950mhz.bin                GPUEB 改 5 字节（GPU 最高 950 MHz）
+  README.md                       固件说明与刷写/恢复步骤
 patches/
   ged-6.12-to-5.10.patch          GED 6.12 → 5.10（478 行）
   gpueb-6.12-to-5.10.patch        gpueb 6.12 → 5.10（1042 行）
@@ -58,6 +64,8 @@ patches/
 docs/
   PORTING.zh-CN.md                完整移植文档（576 行，27 节）
 tools/
+  gpueb_patch.py                  生成 950 MHz 的 GPUEB 固件（5 字节补丁）
+  gtprobe.c                       gpufreq 域/OPP 提交探针内核模块
   glbench.c                       GLES2 填充率 / 提交开销测量
   vkprobe.c                       Vulkan 实例与物理设备探测
   gedboot.c                       单次 GED vsync 注入
@@ -233,15 +241,37 @@ if (g_gpueb_support) {
 **判断档数必须读 `gpufreq_status` 的 `WorkingOPPNum`**，不要数
 `/proc/gpufreqv2/gpu_working_opp_table` 的行数——那个接口会打印一行越界数据。
 
-### 950MHz 不可用
+### 950MHz：固件补丁解锁
 
-固件表里有 6 档（`WorkingOPPNum: 6`），最高 950MHz 在 index 0。但实测请求
-index 0 一律返回 index 1（880MHz），固件层限制，无绕过路径。
+固件表里有 6 档（`WorkingOPPNum: 6`），最高 950MHz 在 index 0，但实测永远只到
+`Index 1`（880MHz）。
 
-同款 MT6895 的 mainline 内核能跑到 core 950MHz，说明硬件本身支持，
-限制来自 MTK 的 GPUEB 固件策略。STACK 域 852MHz 可以正常达到。
+根因是选档循环边界写成 `i > 0`，index 0 被永久排除 —— 这段逻辑写的时候表只有
+5 档、880MHz 在 index 0（注释里还留着 `"Fgpu = 880MHz (OPP[0])"`），后来 950MHz
+插到 index 0，边界没跟着改。
 
----
+AP 侧三条路都堵死（均有实测依据）：
+
+1. `gpufreq_commit(TARGET_GPU, idx)` 返回 0 但固件完全忽略（`tools/gtprobe.c` 验证）
+2. 所有用户空间写接口用 `TARGET_DEFAULT`，dual-buck 下被重映射到 `TARGET_STACK`
+3. EB 模式下 AP 策略表是空结构体 `platform_eb_fp = {}`
+
+修复方式是改固件里的 OPP 表：把 entry[1] 从 880000 改成 950000（5 个字节）。
+GPUEB 是 RISC-V (RV33)，固件未加密、无 hash 校验头。
+
+```bash
+python3 tools/gpueb_patch.py firmware/gpueb_stock.bin firmware/gpueb_950mhz.bin
+fastboot flash gpueb_b firmware/gpueb_950mhz.bin
+```
+
+验证（`FmeterFreq` 是硬件频率计读数，不是软件上报值）：
+
+```
+[GPU-OPP]     Index: 1, Freq: 950000
+[GPU-REALOPP] FmeterFreq: 950015
+```
+
+持续满载 60 秒无 fault、无复位，温度 46-54°C。详见 [firmware/README.md](firmware/README.md)。
 
 ## 已知限制
 
