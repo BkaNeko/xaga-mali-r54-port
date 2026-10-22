@@ -1,0 +1,13 @@
+*.o
+*.o.cmd
+*.ko
+*.mod
+*.mod.c
+*.symversions
+.*.cmd
+.*.o.d
+modules.order
+Module.symvers
+*.img
+*.dtb
+*.dts

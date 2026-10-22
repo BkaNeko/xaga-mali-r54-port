@@ -1,0 +1,598 @@
+diff -ruN a/ged/include/ged_compat_510.h b/ged612/include/ged_compat_510.h
+--- a/ged/include/ged_compat_510.h	1970-01-01 08:00:00.000000000 +0800
++++ b/ged612/include/ged_compat_510.h	2026-10-22 18:13:14.145544903 +0800
+@@ -0,0 +1,81 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/* 5.10 compatibility shims for GED 6.12 */
++#ifndef _GED_COMPAT_510_H_
++#define _GED_COMPAT_510_H_
++
++#include <linux/types.h>
++#include <gpufreq_v2.h>
++
++/* 6.12 gpufreq additions: approximate with the current frequency */
++static inline unsigned int gpufreq_get_cur_out_freq(enum gpufreq_target target)
++{
++	return gpufreq_get_cur_freq(target);
++}
++static inline unsigned int gpufreq_get_cur_avg_freq(enum gpufreq_target target)
++{
++	return gpufreq_get_cur_freq(target);
++}
++
++/* 6.12 workload-mode hints: not supported on 5.10 */
++static inline bool mtk_dvfs_workload_mode(int i32WorkloadMode)
++{
++	(void)i32WorkloadMode;
++	return false;
++}
++static inline bool mtk_get_dvfs_workload_mode(unsigned int *pui32WorkloadMode)
++{
++	if (pui32WorkloadMode)
++		*pui32WorkloadMode = 0;
++	return false;
++}
++
++/* 6.12 gpufreq_v2 additions */
++#ifndef DVFS_FIX_OPP
++#define DVFS_FIX_OPP       (1u << 2)
++#define DVFS_FIX_FREQ_VOLT (1u << 3)
++#endif
++
++/* 6.12 GED commit types: fold onto the closest 5.10 value */
++#ifndef MTK_GPU_DVFS_TYPE_IDLE
++#define MTK_GPU_DVFS_TYPE_IDLE         MTK_GPU_DVFS_TYPE_FALLBACK
++#endif
++#ifndef MTK_GPU_DVFS_TYPE_SKIPFALLBACK
++#define MTK_GPU_DVFS_TYPE_SKIPFALLBACK MTK_GPU_DVFS_TYPE_FALLBACK
++#endif
++
++/* gpufreq asks GED for its commit info; nothing reads these on 5.10 */
++static unsigned long (*ged_get_last_commit_idx_fp)(void);
++static unsigned long (*ged_get_last_commit_top_idx_fp)(void);
++static unsigned long (*ged_get_last_commit_stack_idx_fp)(void);
++static void (*ged_notify_gpu_fix_opp_fp)(int);
++static void (*ged_notify_gpu_fix_freq_volt_fp)(unsigned int, unsigned int);
++
++/* 6.12 mfgsys config API: not present on 5.10 */
++#ifndef FEAT_ENABLE
++#define FEAT_ENABLE 1
++#endif
++#ifndef CONFIG_AXI_MON
++#define CONFIG_AXI_MON 32
++#endif
++static inline int gpufreq_set_mfgsys_config(int config, int feature)
++{
++	(void)config; (void)feature;
++	return 0;
++}
++
++/* 6.12 added a POWERHAL limiter; map it onto the closest 5.10 limiter */
++#ifndef LIMIT_POWERHAL
++#define LIMIT_POWERHAL LIMIT_PBM
++/* 6.12 symbol namespaces: no-op on 5.10 */
++#ifndef MODULE_IMPORT_NS
++#define MODULE_IMPORT_NS(x)
++#endif
++
++#endif
++
++/* 6.12 symbol namespaces: no-op on 5.10 */
++#ifndef MODULE_IMPORT_NS
++#define MODULE_IMPORT_NS(x)
++#endif
++
++#endif
+diff -ruN a/ged/include/ged_dvfs.h b/ged612/include/ged_dvfs.h
+--- a/ged/include/ged_dvfs.h	2026-10-22 18:13:14.139968845 +0800
++++ b/ged612/include/ged_dvfs.h	2026-10-22 18:13:14.144693011 +0800
+@@ -187,7 +187,8 @@
+ 	GED_SLEEP,
+ 	GED_POWER_ON,
+ };
+-void ged_dvfs_gpu_clock_switch_notify(enum ged_gpu_power_state power_state);
++void ged_dvfs_gpu_clock_switch_notify_v612(enum ged_gpu_power_state power_state);
++void ged_dvfs_gpu_clock_switch_notify(bool bSwitch);
+ void ged_gpu_autosuspend_timeout_notify(int autosuspend_timeout_ms);
+ 
+ unsigned int ged_gpu_whitebox_power_test_case(int replace);
+diff -ruN a/ged/include/ged_perfetto_tracepoint.h b/ged612/include/ged_perfetto_tracepoint.h
+--- a/ged/include/ged_perfetto_tracepoint.h	2026-10-22 18:13:14.140740273 +0800
++++ b/ged612/include/ged_perfetto_tracepoint.h	2026-10-22 18:13:14.145600692 +0800
+@@ -29,7 +29,7 @@
+ 
+ 	TP_fast_assign(
+ 		__entry->pid = pid;
+-		__assign_str(name);
++		__assign_str(name, name);
+ 		__entry->value = value;
+ 	),
+ 
+diff -ruN a/ged/include/ged_tracepoint.h b/ged612/include/ged_tracepoint.h
+--- a/ged/include/ged_tracepoint.h	2026-10-22 18:13:14.140914843 +0800
++++ b/ged612/include/ged_tracepoint.h	2026-10-22 18:13:14.145455750 +0800
+@@ -26,7 +26,7 @@
+ 
+ 	TP_fast_assign(
+ 		__entry->pid = pid;
+-		__assign_str(name);
++		__assign_str(name, name);
+ 		__entry->value = value;
+ 	),
+ 
+@@ -1574,7 +1574,7 @@
+ 		__field(unsigned int, t7)
+ 	),
+ 	TP_fast_assign(
+-		__assign_str(name);
++		__assign_str(name, name);
+ 		__entry->u0 = arg[0];
+ 		__entry->u1 = arg[1];
+ 		__entry->u2 = arg[2];
+diff -ruN a/ged/include/gpu_bm.h b/ged612/include/gpu_bm.h
+--- a/ged/include/gpu_bm.h	1970-01-01 08:00:00.000000000 +0800
++++ b/ged612/include/gpu_bm.h	2026-10-22 18:13:14.145574966 +0800
+@@ -0,0 +1,20 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/* GED-local view of the 5.10 gpu_bm interface (struct + prototypes) */
++#ifndef __GPU_BM_H__
++#define __GPU_BM_H__
++
++#include <linux/types.h>
++
++struct v1_data {
++	unsigned int version;
++	unsigned int ctx;
++	unsigned int frame;
++	unsigned int job;
++	unsigned int freq;
++};
++
++void MTKGPUQoS_mode(int seg_flag);
++void MTKGPUQoS_setup(struct v1_data *v1, phys_addr_t phyaddr, size_t size);
++int MTKGPUQoS_is_inited(void);
++
++#endif
+diff -ruN a/ged/Makefile b/ged612/Makefile
+--- a/ged/Makefile	2026-10-22 18:13:14.139553099 +0800
++++ b/ged612/Makefile	2026-10-22 18:13:14.154715203 +0800
+@@ -10,12 +10,18 @@
+ # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ # GNU General Public License for more details.
+ #
+-GED_TOP = $(DEVICE_MODULES_PATH)/drivers/gpu/mediatek/ged
+-MTK_TOP = $(DEVICE_MODULES_PATH)/drivers/misc/mediatek/
+-GPU_TOP = $(DEVICE_MODULES_PATH)/drivers/gpu/mediatek/
+-VIDEOX_TOP = $(DEVICE_MODULES_PATH)/drivers/misc/mediatek/video/$(MTK_PLATFORM)/videox
+-
+-ccflags-y += \
++GED_TOP = $(srctree)/drivers/gpu/mediatek/ged612
++MTK_TOP = $(srctree)/drivers/misc/mediatek/
++GPU_TOP = $(srctree)/drivers/gpu/mediatek/
++VIDEOX_TOP = $(srctree)/drivers/misc/mediatek/video/$(MTK_PLATFORM)/videox
++
++ccflags-y += -std=gnu11 -Wno-error=implicit-function-declaration \
++	-Wno-error=incompatible-function-pointer-types \
++	-Wno-error=incompatible-pointer-types -Wno-error=int-conversion \
++	-Wno-error=declaration-after-statement \
++	-include $(GED_TOP)/include/ged_compat_510.h \
++	-Wno-error=macro-redefined \
++		-I$(srctree)/drivers/gpu/mediatek/mt-plat/ \
+         -Wno-unused-variable \
+         -Wno-unused-function
+ 
+@@ -54,32 +60,50 @@
+ ccflags-y += -DGED_DCS_POLICY
+ endif
+ 
+-ccflags-y += \
+-		-I$(DEVICE_MODULES_PATH)/include/ \
++ccflags-y += -std=gnu11 -Wno-error=implicit-function-declaration \
++	-Wno-error=incompatible-function-pointer-types \
++	-Wno-error=incompatible-pointer-types -Wno-error=int-conversion \
++	-Wno-error=declaration-after-statement \
++	-include $(GED_TOP)/include/ged_compat_510.h \
++	-Wno-error=macro-redefined \
++		-I$(srctree)/drivers/gpu/mediatek/mt-plat/ \
++		-I$(srctree)/include/ \
+ 		-I$(MTK_TOP)/include/ \
+ 		-I$(GED_TOP)/include/ \
+ 		-I$(GED_TOP)/include/platform/ \
+ 		-I$(GPU_TOP)/hal/ \
+ 		-I$(GPU_TOP)/ \
+-		-I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/lcm/inc/ \
+-		-I$(DEVICE_MODULES_PATH)/drivers/gpu/mediatek/gpufreq/ \
+-		-I$(DEVICE_MODULES_PATH)/drivers/gpu/mediatek/gpufreq/v1/include/ \
+-		-I$(DEVICE_MODULES_PATH)/drivers/gpu/mediatek/gpufreq/v2/include/ \
+-		-I$(DEVICE_MODULES_PATH)/drivers/gpu/mediatek/gpufreq/v2_legacy/include/ \
+-		-I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/performance/fpsgo_v3 \
++		-I$(srctree)/drivers/misc/mediatek/lcm/inc/ \
++		-I$(srctree)/drivers/gpu/mediatek/gpufreq/ \
++		-I$(srctree)/drivers/gpu/mediatek/gpufreq/v1/include/ \
++		-I$(srctree)/drivers/gpu/mediatek/gpufreq/v2/include/ \
++		-I$(srctree)/drivers/gpu/mediatek/gpufreq/v2_legacy/include/ \
++		-I$(srctree)/drivers/misc/mediatek/performance/fpsgo_v3 \
+ 		-I$(VIDEOX_TOP)/ \
+-		-I$(DEVICE_MODULES_PATH)/drivers/gpu/drm/mediatek/mediatek_v2/ \
+-		-I$(DEVICE_MODULES_PATH)/drivers/gpu/mediatek/gpueb/include/ \
+-		-I$(DEVICE_MODULES_PATH)/drivers/dma-buf/heaps/ \
+-		-I$(DEVICE_MODULES_PATH)/drivers/thermal/mediatek
+-ccflags-y += \
+-		-I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/cmdq/v3
+-ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/gpu/mediatek/gpueb
+-ccflags-y += \
+-		-I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/sspm/ \
+-		-I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/sspm/v2 \
+-		-I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/qos/ \
+-		-I$(DEVICE_MODULES_PATH)/drivers/gpu/mediatek/gpu_bm/
++		-I$(srctree)/drivers/gpu/drm/mediatek/mediatek_v2/ \
++		-I$(srctree)/drivers/gpu/mediatek/gpueb/include/ \
++		-I$(srctree)/drivers/dma-buf/heaps/ \
++		-I$(srctree)/drivers/thermal/mediatek
++ccflags-y += -std=gnu11 -Wno-error=implicit-function-declaration \
++	-Wno-error=incompatible-function-pointer-types \
++	-Wno-error=incompatible-pointer-types -Wno-error=int-conversion \
++	-Wno-error=declaration-after-statement \
++	-include $(GED_TOP)/include/ged_compat_510.h \
++	-Wno-error=macro-redefined \
++		-I$(srctree)/drivers/gpu/mediatek/mt-plat/ \
++		-I$(srctree)/drivers/misc/mediatek/cmdq/v3
++ccflags-y += -I$(srctree)/drivers/gpu/mediatek/gpueb
++ccflags-y += -std=gnu11 -Wno-error=implicit-function-declaration \
++	-Wno-error=incompatible-function-pointer-types \
++	-Wno-error=incompatible-pointer-types -Wno-error=int-conversion \
++	-Wno-error=declaration-after-statement \
++	-include $(GED_TOP)/include/ged_compat_510.h \
++	-Wno-error=macro-redefined \
++		-I$(srctree)/drivers/gpu/mediatek/mt-plat/ \
++		-I$(srctree)/drivers/misc/mediatek/sspm/ \
++		-I$(srctree)/drivers/misc/mediatek/sspm/v2 \
++		-I$(srctree)/drivers/misc/mediatek/qos/ \
++		-I$(srctree)/drivers/gpu/mediatek/gpu_bm/
+ 
+ ifeq ($(CONFIG_DEBUG_FS),y)
+ ccflags-y += -DGED_DEBUG_FS
+@@ -117,12 +141,14 @@
+ 	src/ged_gpu_bm.o \
+ 	src/ged_gpu_slc.o \
+ 	src/ged_mali_event.o \
+-	src/ged_gpu_memsys.o
++	src/ged_gpu_memsys.o \
++	src/ged_compat_510.o
+ endif
+ 
+ ged-$(CONFIG_SYNC_FILE) += src/ged_sync.o
+ 
+-# obj-$(CONFIG_MTK_GPU_SUPPORT) += ged.o
++obj-$(CONFIG_MTK_GPU_SUPPORT) += ged.o
++ ged-objs := $(ged-y)
+ 
+ # mtk_ged_mt6991-y := src/platform/ged_mt6991.o
+ 
+diff -ruN a/ged/Module.symvers b/ged612/Module.symvers
+--- a/ged/Module.symvers	1970-01-01 08:00:00.000000000 +0800
++++ b/ged612/Module.symvers	2026-10-22 18:13:14.159104911 +0800
+@@ -0,0 +1,207 @@
++0x024df890	mtk_gpueb_dvfs_set_mode	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x588e68da	ged_get_whitebox_power_test_case_clear	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0xc1d3ce96	ged_dvfs_get_desire_mask	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0xcaa33e10	ged_gpu_apo_init_nolock	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x654a9aeb	ged_dvfs_get_util_ta	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x50e668d6	ged_dvfs_get_util_3d	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x1f1724b1	ged_dvfs_cal_gpu_utilization_ex_fp	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x662279c8	dcs_set_adjust_fr_cnt	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0xe04fd004	dcs_get_adjust_fr_cnt	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x84bbb152	ged_check_apo_api_boost	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x50a50599	ged_log_dump	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x22f9c7c1	ged_gpu_predict_apo_reset_nolock	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x58f1b110	get_sf_edge_hint	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x54ef7b39	ged_mali_event_update_cs_error_nolock	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x0721b224	ged_check_predict_power_duration	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x1c0df825	ged_dvfs_get_gov_mask_support	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x956f7afb	ged_set_apo_autosuspend_delay_ms_nolock	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x67f8ce5c	ged_dvfs_record_soc_timer	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x7cf81440	ged_dvfs_update_step_size	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0xb089b165	ged_set_target_fps	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0xc2100112	ged_kpi_output_gfx_info2_fp	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x2a3808cf	ged_gpu_slc_get_dynamic_mode	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL_GPL	
++0x88288a28	ged_mali_worker_event_register_callback	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x5a83b0f2	ged_kpi_set_fw_idle_mode	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x1910e5a3	ged_set_apo_wakeup_ns	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0xc2123b65	ged_get_apo_wakeup_ns	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x741891c3	mtk_gpueb_mbrain_read	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x1831c736	ged_set_apo_force_hint	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0xd3c7cc45	ged_get_apo_force_hint	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x479d8bba	ged_set_apo_autosuspend_delay_ctrl	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x7f33d39f	ged_get_apo_autosuspend_delay_ctrl	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0xae6bdc17	ged_dvfs_set_sysram_last_commit_stack_idx	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x066d77ef	ged_kpi_get_target_fps	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x347c1987	ged_mali_event_notify_gpu_reset_done	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x802b3ec8	ged_mali_worker_event_unregister_callback	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x98b369b7	ged_dvfs_set_gov_mask_enable	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x80df8f62	ged_dvfs_get_gov_mask_enable	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0xd9f56975	ged_dvfs_write_sysram_last_commit_idx_test	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x126ade94	mtk_gpueb_set_fallback_mode	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0xe03e3a34	ged_trace_ast_cond	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0xbd78bbdb	ged_get_active_time	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x44469fd1	ged_set_whitebox_power_state_store	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x3e452355	ged_dvfs_set_sysram_last_commit_dual_idx	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x64342810	ged_get_power_duration	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x88271236	ged_dvfs_write_sysram_last_commit_top_idx_test	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x8ea6e90c	ged_set_apo_api_sync_status	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x1ea01a8c	ged_kpi_gpu_dvfs_fp	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0xf343507d	ged_kpi_set_gift_status	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x0f78cd14	ged_dvfs_set_sysram_last_commit_top_idx	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x04734cc2	ged_mali_event_register_fence_timeout_callback	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0xc0fb37f5	ged_sw_vsync_event_fp	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x69800b75	ged_gpu_apo_reset_nolock	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0xa454238c	ged_dvfs_get_last_commit_stack_idx	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x07b5db5a	ged_notification	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x3183b4d6	mtk_bandwidth_resource_init	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x9883df5c	ged_mali_event_update_gpu_reset	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x4cd86ecb	dcs_set_adjust_ratio_th	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x3a09bf57	dcs_get_adjust_ratio_th	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x29e0eb9c	mtk_gpueb_sysram_multi_read	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x4a24ad86	ged_set_apo_status	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x71d75692	ged_dvfs_write_sysram_last_commit_idx	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x6226d2d6	ged_mali_event_update_gpu_reset_nolock	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0xc278e5ad	ged_gpu_autosuspend_timeout_notify	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0xe76b433c	ged_dvfs_set_gpu_core_mask_fp	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0xe0f98233	ged_dvfs_query_opp_cost	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x5773c2e8	ged_dvfs_write_sysram_virtual_commit_idx	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x27307250	ged_set_apo_wakeup_ns_nolock	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x343bee22	ged_log_buf_free	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x9e1ac58e	ged_gpu_is_heavy	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x15acd8de	ged_gpu_slc_dynamic_mode	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL_GPL	
++0x0a922802	ged_check_predict_power_autosuspend_nolock	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x6f9ca63d	mtk_gpueb_dvfs_get_desire_freq	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x5b5ad02a	ged_dvfs_query_loading	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x8b686411	ged_dvfs_get_util_comp	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x46ec0445	ged_log_buf_reset	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x628dab59	ged_gpu_predict_apo_notify	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0xade3626a	ged_trace_idle_timer_enabled	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x6d4ca3d4	mtk_gpueb_sysram_batch_read	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x1edd2512	ged_check_power_duration	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0xc7b5dd0d	ged_dvfs_write_sysram_protm_enter	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0xc7b6f5cf	mtk_gpueb_sysram_rb_write	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x2aec1297	ged_set_apo_autosuspend_delay_target_ref_count	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x16f2dd3f	ged_get_apo_autosuspend_delay_target_ref_count	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0xd79edfc1	ged_get_idle_time	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x4d4f8132	ged_vsync_notifier_fp	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x533f3f13	ged_get_api_boost_start_ts_ns	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0xe992fadb	ged_check_predict_power_autosuspend	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0xef60e125	mtk_gpueb_dvfs_commit	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x766ac4ae	ged_kpi_get_panel_refresh_rate	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0xa5c2c3e6	ged_mali_event_update_device_lost	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0xaa194557	mtk_gpueb_sysram_read	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0xa1d3c8ea	ged_kpi_set_gift_target_pid	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x6733c327	ged_kpi_trigger_fb_dvfs_fp	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0xbd0e9a3e	ged_dvfs_get_last_commit_dual_idx	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x1d751121	ged_get_api_boost_end_ts_ns	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0xa6fa66bd	ged_get_predict_power_duration	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x573c27de	ged_gpu_power_stress_test_enable	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0xee05366b	ged_get_apo_hint	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x94f7d11b	ged_gpu_apo_support	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x8da900a3	ged_mali_event_register_gpu_reset_done_callback	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x95096d9c	ged_get_predict_active_time	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x23e0c7af	ged_dvfs_write_sysram_last_commit_stack_idx_test	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x1eac475d	ged_gpu_whitebox_power_test_support	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x5ba191e4	ged_set_apo_thr_ns	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x2c5922a1	ged_get_apo_thr_ns	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x31dcb499	ged_get_whitebox_power_test_support	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x8756a4a6	ged_is_fdvfs_support	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0xe384f98c	mtk_gpueb_sysram_read_u64	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0xdfaa0c7d	ged_notify_fix_opp_from_gpufreq	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0xc4cb97d8	ged_notify_fix_freq_volt_from_gpufreq	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0xf743f07c	ged_dvfs_write_sysram_last_commit_dual_test	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x292ad0fb	ged_get_apo_api_boost	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x61ab2eaa	ged_log_buf_get_early	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0xc432725b	ged_kpi_query_gpu_dvfs_info	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x5fe3385c	mtk_gpueb_dvfs_set_frame_done	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x7466e8ef	ged_trace_fw_soi_enabled	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x0ab3f4a2	ged_dvfs_get_last_commit_top_idx	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0xfce64442	check_pm_callback_state	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x65516446	ged_get_predict_idle_time	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x82e4a3c3	ged_gpu_memsys_feature_enable	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL_GPL	
++0x10a0f365	dcs_set_adjust_non_dcs_th	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x3d220121	dcs_get_adjust_non_dcs_th	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0xc904191f	ged_dvfs_gpu_freq_dual_commit_fp	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x8f4f0048	ged_query_info	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x3dfdda96	dcs_enable	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x693292e9	is_gpu_ged_log_enable	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x3da674db	ged_kpi_set_target_FPS_api	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x9f2b7f73	ged_dvfs_get_dcs_enable	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0xb0163f90	ged_register_platform_fp	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x5daf04e1	ged_dvfs_get_util_active	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x4938108a	ged_dvfs_write_sysram_last_commit_dual	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0xecca10bc	ged_get_apo_autosuspend_delay_ref_count	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x96e6a0d3	ged_set_autosuspend_stress	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x850c2121	ged_get_autosuspend_stress	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x23891ae2	mtk_gpueb_dvfs_set_frame_base_dvfs	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0xf9ef77a4	ged_get_segment_id	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0xabe542dd	ged_kpi_set_cpu_remained_time_fp	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x1284993d	mtk_gpueb_dvfs_set_taget_frame_time	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x66cea722	mtk_gpueb_dvfs_dcs_commit	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x95aec6c5	qos_get_frame_nr	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x401fd279	ged_kpi_hint_frame_info	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0xee17eeb1	get_api_sync_flag	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0xd2812589	ged_trace_ast	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x7ef2191e	dump_pm_callback_kbase_info	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0xbe5b141a	ged_mali_event_notify_fence_timeout_event	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x45e91881	ged_mali_event_unregister_gpu_reset_done_callback	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x9dfa3af7	mtk_gpueb_sysram_write	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0xa1fac806	ged_write_sysram_pwr_hint	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x70c1cca8	ged_kpi_set_target_FPS_margin	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0xa0871d5b	ged_mali_event_init	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0xf5e5515d	ged_mali_event_update_device_lost_nolock	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0xb28fb28b	ged_kpi_fastdvfs_update_dcs_fp	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x9f3f7969	ged_kpi_query_dvfs_freq_pred	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x6bf0c7dc	ged_dvfs_gpu_clock_switch_notify	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x2af75e15	ged_set_all_apo_thr_ns_nolock	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0xfb003548	ged_set_apo_autosuspend_delay_ms_ref_idletime	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0xae40922f	ged_dvfs_write_sysram_last_commit_top_idx	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x4211af7c	ged_gpu_apo_api_sync_support	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x0a754128	ged_gpu_whitebox_power_test_case	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x0072fecf	ged_trace_scheduler_state	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x289c665d	ged_kpi_set_gpu_dvfs_hint_fp	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x78b0eaa9	ged_kpi_enable_fw_idle_policy	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0xcde3f86b	ged_get_whitebox_power_test_case	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0xd7cbf701	mtk_gpueb_dvfs_get_cur_freq	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0xa6c8a5d6	ged_get_api_boost_interval_ns	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x9e667b51	ged_driver_done	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x01a76c65	ged_mali_event_update_pmode_flag	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x866e5bec	ged_get_gpu_frame_time	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x2db97e11	ged_gpu_apo_notify	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x29708168	dcs_set_adjust_support	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0xe11956cf	dcs_get_adjust_support	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0xf18c07ad	ged_set_apo_api_boost_thr_ns	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x64d73649	ged_get_apo_api_boost_thr_ns	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0xcb3d5adc	ged_log_buf_get	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x8ea8a514	ged_dvfs_write_sysram_last_commit_stack_idx	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x97952ce9	ged_dvfs_write_sysram_protm_exit	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x4e7bb734	mtk_gpueb_set_power_state	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0xec361f90	ged_log_buf_print	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0xc7cb546b	ged_dvfs_gpu_clock_switch_notify_v612	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0xa998e019	ged_gpu_predict_apo_reset	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x40e882c3	ged_dvfs_get_real_oppfreq_num	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0xe4931974	ged_dvfs_gpu_freq_commit_fp	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0xb55a47f8	ged_set_apo_legacy	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0xbe9fd87c	ged_get_apo_legacy	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x6a3e0593	ged_mali_worker_event_notify_callback	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x9a5d59c9	ged_set_apo_lp_thr_ns	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0xe1e17b13	ged_get_apo_lp_thr_ns	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x21173af9	ged_log_buf_print2	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0xb7bbcd35	ged_gpu_predict_apo_init_nolock	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0xeb26b989	ged_set_apo_autosuspend_delay_ms	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x94f49b1e	ged_get_apo_autosuspend_delay_ms	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x8878d3f9	mtk_gpueb_set_stability_mode	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x30724c84	ged_do_platform_related_init	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x633a5982	mtk_gpueb_dvfs_get_frame_loading	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0xf591cac9	ged_dvfs_get_last_commit_idx	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0xb8fbef8f	ged_gpu_apo_reset	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x56d22064	ged_set_apo_autosuspend_delay_ms_ref_idletime_nolock	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x05d35fae	reset_sf_edge_hint	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0xaa8a8271	ged_mali_event_update_pmode_flag_nolock	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x7d8d0e14	ged_log_buf_alloc	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x4ba83e77	mtk_gpueb_dvfs_get_desire_freq_dual	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x12b5b116	mtk_gpueb_dvfs_get_mode	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x60657ec4	ged_mali_event_unregister_fence_timeout_callback	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x7ac98637	mtk_gpueb_power_modle_cmd	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0xc593883d	ged_dvfs_query_power_state_time	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0xfe109cc7	ged_reset_api_boost_interval_ns	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
++0x7dbe8f3c	ged_kpi_check_if_fallback_mode_fp	drivers/gpu/mediatek/ged612/ged	EXPORT_SYMBOL	
+diff -ruN a/ged/src/ged_compat_510.c b/ged612/src/ged_compat_510.c
+--- a/ged/src/ged_compat_510.c	1970-01-01 08:00:00.000000000 +0800
++++ b/ged612/src/ged_compat_510.c	2026-10-22 18:13:14.146786633 +0800
+@@ -0,0 +1,40 @@
++// SPDX-License-Identifier: GPL-2.0
++/* 5.10 stubs for interfaces GED 6.12 expects from other 6.12 modules */
++#include <linux/types.h>
++#include <linux/errno.h>
++
++int gpufreq_get_cur_temperature(void)
++{
++	return 0;
++}
++
++unsigned int gpufreq_wrapper_ready(void)
++{
++	return 1;
++}
++
++void MTKGPUQoS_mode_ratio(int mode)
++{
++	(void)mode;
++}
++
++int mtk_ipi_send_compl_to_gpueb(int ipi_id, int opt, void *data, int len,
++				unsigned long timeout)
++{
++	(void)ipi_id; (void)opt; (void)data; (void)len; (void)timeout;
++	return -ENODEV;
++}
++
++void set_gpu_pre_throttle(int value, int level)
++{
++	(void)value; (void)level;
++}
++
++void set_gpu_pre_throttle_opp(int opp, int level)
++{
++	(void)opp; (void)level;
++}
++
++/* 6.12 exports these as pointers filled in by GED itself */
++void (*mtk_dvfs_workload_mode_fp)(int i32WorkloadMode);
++int (*mtk_get_dvfs_workload_mode_fp)(void);
+diff -ruN a/ged/src/ged_dcs.c b/ged612/src/ged_dcs.c
+--- a/ged/src/ged_dcs.c	2026-10-22 18:13:14.141373615 +0800
++++ b/ged612/src/ged_dcs.c	2026-10-22 18:13:14.152731059 +0800
+@@ -2,6 +2,7 @@
+ /*
+  * Copyright (c) 2021 MediaTek Inc.
+  */
++#include <linux/of.h>
+ #include <linux/types.h>
+ #include <linux/slab.h>
+ #include <linux/fb.h>
+diff -ruN a/ged/src/ged_dvfs.c b/ged612/src/ged_dvfs.c
+--- a/ged/src/ged_dvfs.c	2026-10-22 18:13:14.141572122 +0800
++++ b/ged612/src/ged_dvfs.c	2026-10-22 18:13:14.145939297 +0800
+@@ -3,6 +3,7 @@
+  * Copyright (c) 2019 MediaTek Inc.
+  */
+ 
++#include <linux/of.h>
+ #include <linux/slab.h>
+ #include <linux/sched.h>
+ #include <linux/module.h>
+diff -ruN a/ged/src/ged_ge.h b/ged612/src/ged_ge.h
+--- a/ged/src/ged_ge.h	2026-10-22 18:13:14.141853820 +0800
++++ b/ged612/src/ged_ge.h	2026-10-22 18:13:14.151142878 +0800
+@@ -12,7 +12,7 @@
+ /* Must be the same as item number in region_sizes[], which in
+  * /vendor/mediatek/proprietary/hardware/gralloc_extra/ge_misc.cpp
+  */
+-#define GE_ALLOC_STRUCT_NUM 22
++#define GE_ALLOC_STRUCT_NUM 18
+ #define GE_MAX_REGION_SIZE 8192
+ 
+ GED_ERROR ged_ge_init(void);
+diff -ruN a/ged/src/ged_kpi.c b/ged612/src/ged_kpi.c
+--- a/ged/src/ged_kpi.c	2026-10-22 18:13:14.142428625 +0800
++++ b/ged612/src/ged_kpi.c	2026-10-22 18:13:14.147351031 +0800
+@@ -2,6 +2,7 @@
+ /*
+  * Copyright (c) 2019 MediaTek Inc.
+  */
++#include <linux/of.h>
+ #include <linux/semaphore.h>
+ #include <linux/time.h>
+ #include <linux/jiffies.h>
+diff -ruN a/ged/src/ged_notify_sw_vsync.c b/ged612/src/ged_notify_sw_vsync.c
+--- a/ged/src/ged_notify_sw_vsync.c	2026-10-22 18:13:14.142775440 +0800
++++ b/ged612/src/ged_notify_sw_vsync.c	2026-10-22 18:13:14.147040859 +0800
+@@ -2087,7 +2087,7 @@
+ }
+ /* MBrain end */
+ 
+-void ged_dvfs_gpu_clock_switch_notify(enum ged_gpu_power_state power_state)
++void ged_dvfs_gpu_clock_switch_notify_v612(enum ged_gpu_power_state power_state)
+ {
+ 	enum gpu_dvfs_policy_state policy_state;
+ 
+@@ -2170,6 +2170,14 @@
+ 	//MBrain
+ 	ged_dvfs_update_power_state_time(power_state);
+ }
++EXPORT_SYMBOL(ged_dvfs_gpu_clock_switch_notify_v612);
++
++/* 5.10 ABI: kbase passes a boolean, keep the original symbol/CRC intact */
++void ged_dvfs_gpu_clock_switch_notify(bool bSwitch)
++{
++	ged_dvfs_gpu_clock_switch_notify_v612(bSwitch ?
++		GED_POWER_ON : GED_POWER_OFF);
++}
+ EXPORT_SYMBOL(ged_dvfs_gpu_clock_switch_notify);
+ 
+ /* MBrain */
