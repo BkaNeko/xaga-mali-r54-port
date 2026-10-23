@@ -45,6 +45,10 @@ mali_csffw.bin    (firmware)   ─┘
 ## 仓库结构
 
 ```
+blobs/
+  vendor/                          Mali r54 用户态库（13 个，51.7MB 主库）
+  vendor_dlkm/                     r54 / GED / GPUEB 内核模块（5 个）
+  README.md                        完整清单与 md5
 files/
   vendor-build.prop.egl-r54        44 条 ro.vendor.arm.egl.configs.* 属性
   mali_platform.config             驱动平台配置（sepolicy 已预期其存在）

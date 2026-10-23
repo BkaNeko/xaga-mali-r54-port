@@ -22,13 +22,17 @@ firmware/
   mali_csffw.bin      ARM Mali CSF 固件（ARM Ltd. 专有）
   gpueb_stock.bin     MediaTek GPUEB 协处理器固件（MediaTek Inc. 专有）
   gpueb_950mhz.bin    同上，由 gpueb_patch.py 修改 5 个字节生成
+
+blobs/
+  vendor/             Mali r54 用户态库（ARM Ltd. / MediaTek Inc. 专有）
+  vendor_dlkm/        Mali r54 / GED / GPUEB 内核模块（同上）
 ```
 
 这些是厂商的二进制固件，**不是开源代码**，不适用本仓库的 GPL-2.0 / MIT 许可。
 收录目的仅为记录移植工作所需的配对版本、以及使 950 MHz 补丁可复现与可回滚。
 
 重新分发前请自行确认 ARM 与 MediaTek 的授权条款。若你只关心源码层面的改动，
-可以删除整个 `firmware/` 目录，仓库其余部分不受影响。
+可以删除整个 `firmware/` 和 `blobs/` 目录，仓库其余部分不受影响。
 
 ## 工具（MIT）
 

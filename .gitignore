@@ -11,3 +11,7 @@ Module.symvers
 *.img
 *.dtb
 *.dts
+
+# blobs/ 里是移植必需的预编译二进制，必须入库
+!blobs/vendor_dlkm/*.ko
+!blobs/**/*.so
