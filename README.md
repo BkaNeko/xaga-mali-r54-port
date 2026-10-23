@@ -45,6 +45,12 @@ mali_csffw.bin    (firmware)   ─┘
 ## 仓库结构
 
 ```
+files/
+  vendor-build.prop.egl-r54        44 条 ro.vendor.arm.egl.configs.* 属性
+  mali_platform.config             驱动平台配置（sepolicy 已预期其存在）
+  init.insmod.mt6895.cfg           模块加载清单（含 GPU 链显式 insmod）
+  android.hardware.vulkan.version.xml
+  android.software.vulkan.deqp.level.xml
 firmware/
   mali_csffw.bin                  Mali CSF 固件 UK 1.38（ARM 专有）
   gpueb_stock.bin                 GPUEB 原厂固件（GPU 最高 880 MHz）
@@ -225,7 +231,8 @@ kbase 内置 DVFS（唯一决策源）
 | 4 | **`TARGET_GPU` 提交在 gpueb 模式下无效** | `ret=0` 但频率不变 |
 | 5 | 打印 `mtk_opp_freq[5]` 但只有 5 档 | 启动日志垃圾数据 |
 
-详见 [docs/PORTING.zh-CN.md](docs/PORTING.zh-CN.md) 第四部分。
+详见 [
+docs/PORTING.zh-CN.md              移植步骤（只讲怎么做）
 
 ### gpueb 模式下 OPP 表来自固件
 

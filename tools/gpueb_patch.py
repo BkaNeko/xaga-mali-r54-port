@@ -31,8 +31,14 @@ highest OPP the firmware can reach the one we want.
 
 Patch: 5 bytes, file size unchanged.
 
+The OTA payload only carries 128 KiB for the gpueb partition; the partition
+itself is 1 MiB and the stock image pads the tail with 0x00 (not 0xFF). Use
+--pad-to to reproduce that, so the result differs from stock in exactly the
+five patched bytes.
+
 Usage:
     python3 gpueb_patch.py firmware/gpueb_stock.bin firmware/gpueb_950mhz.bin
+    python3 gpueb_patch.py gpueb.img gpueb_950.img --pad-to 1048576
 """
 
 import struct
@@ -71,11 +77,28 @@ def dump_table(buf, count=6):
 
 
 def main():
-    if len(sys.argv) != 3:
+    argv = sys.argv[1:]
+    pad_to = None
+    positional = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--pad-to":
+            pad_to = int(argv[i + 1])
+            i += 2
+            continue
+        if a.startswith("--pad-to="):
+            pad_to = int(a.split("=", 1)[1])
+            i += 1
+            continue
+        positional.append(a)
+        i += 1
+
+    if len(positional) != 2:
         print(__doc__)
         return 1
 
-    src, dst = sys.argv[1], sys.argv[2]
+    src, dst = positional
     with open(src, "rb") as f:
         data = bytearray(f.read())
 
@@ -94,8 +117,15 @@ def main():
     data[base + OFF_FREQ:base + OFF_FREQ + 4] = struct.pack("<I", NEW_FREQ)
     data[base + OFF_VSRAM:base + OFF_VSRAM + 4] = struct.pack("<I", NEW_VSRAM)
 
+    out = bytes(data)
+    if pad_to and len(out) < pad_to:
+        # Pad with 0x00: that is what the stock partition looks like past the
+        # payload. Padding with 0xFF produces a different image.
+        out = out + b"\x00" * (pad_to - len(out))
+        print(f"padded {len(data)} -> {len(out)} bytes with 0x00")
+
     with open(dst, "wb") as f:
-        f.write(data)
+        f.write(out)
 
     print(f"patched: {dst}")
     dump_table(data)
