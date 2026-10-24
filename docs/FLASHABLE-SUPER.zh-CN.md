@@ -150,30 +150,52 @@ pm list features | grep -E 'vulkan.(version|deqp)'  # 4206592 / 132711169
 （该材质的 `SOFT_LIGHT` 混合其实是 SystemUI 侧 `BlendModeToken` 下发的，走 hwui 的 MiBlend AGSL，
 与 `GL_KHR_blend_equation_advanced` 无关；隐藏该扩展对这种走 MiGlass 的面板无效。）
 
-### 8.2 memtrack 拿不到显存
+### 8.2 memtrack 拿不到显存（已修复）
 
-r54 kbase 只在 **debugfs** 暴露显存统计（`kbasep_gpu_memory_debugfs_init` → `/sys/kernel/debug/mali0/gpu_memory`），
-而 MTK 的 memtrack HAL 只读 `/proc/mtk_mali/gpu_memory` 和 `/proc/mali/memory_usage`，两个 `fopen` 都失败，
-`dumpsys meminfo` 的 GPU 内存为 0。
+现象：`dumpsys meminfo` 里没有 `GL mtrack`/`EGL mtrack`，日志里
+`[memtrack] fopen /proc/mtk_mali/gpu_memory fail` 反复刷。
 
-纯镜像层面**修不了**，两条路都要动镜像之外的东西：
+原因：r54 kbase 只在 debugfs 暴露显存统计，而 MTK 的 memtrack HAL 只读
+`/proc/mtk_mali/gpu_memory`。但**源码其实一直在树里**
+（`platform/mtk_platform_common/mtk_platform_memtrack.c`，输出
+`  kctx-0x%p %10u %10u` 正好对上 HAL 的 `fscanf(fp, "  %*s %ld %u\n", ...)`），
+只是没被编译进去。
 
-- 在 kbase 里加回 MTK 的 `/proc/mtk_mali/gpu_memory`：**源码其实已经在** r54 树里
-  （`platform/mtk_platform_common/mtk_platform_memtrack.c`，输出格式
-  `  kctx-0x%p %10u %10u` 正好对上 HAL 的 `fscanf(fp, "  %*s %ld %u\n", ...)`），
-  只是 mt6895 分支没打开开关。要做的就是在这棵树里补：
-  ```make
-  # gpu/arm/midgard/Makefile，mt6895 分支
-  CONFIG_MALI_MTK_MEMTRACK := y
-  ```
-  以及让预处理器看到这个宏（`include/generated/autoconf.h` /
-  `include/config/auto.conf`），Kbuild 里已有
-  `ifeq ($(CONFIG_MALI_MTK_MEMTRACK),y) mali_kbase-y += .../mtk_platform_memtrack.o`
-  的现成门控。注意这条会连带 DVFS_POLICY 等 MTK 配置一起要，必须用原厂的完整构建配置重编，
-  不能只挑这一个宏。
-- 或挂 debugfs + 给 memtrack 域补 `debugfs` 读权限（需要重编 sepolicy）。
+修复：重编 kbase，把两个开关补上。
 
-影响面：只丢统计（LMK 少一份参考），不影响渲染与频率。
+```make
+# gpu/arm/midgard/Makefile，mt6895 分支
+CONFIG_MALI_MTK_MEMTRACK := y
+```
+
+```bash
+# 构建时补两个预处理器宏（这棵树的 .config 里没有这两个符号，
+# Makefile 里的 := y 只影响对象清单，进不了预处理器）
+KCFLAGS="-DCONFIG_MALI_MTK_PROC_FS=1 -DCONFIG_MALI_MTK_MEMTRACK=1 ..."
+```
+
+- `CONFIG_MALI_MTK_PROC_FS` 管住 `mtk_common_procfs_init()` 的**调用点**（少它连
+  `/proc/mtk_mali` 目录都不会建）
+- `CONFIG_MALI_MTK_MEMTRACK` 管住 `memtrack.o` 与 `mtk_memtrack_procfs_init()` 的调用
+
+构建脚本见 `tools/build-mali-ko.sh`（含 `KBUILD_MODPOST_WARN=1`、
+`-Wno-error=*`、`llvm-strip --strip-debug` 46 MB → 2.57 MB 这几处必要处理）。
+
+设备实测：
+
+```
+# ls /proc/mtk_mali/
+gpu_memory  gpu_utilization
+# cat /proc/mtk_mali/gpu_memory
+mali0                 106090
+  kctx-0x0000000022181933    7310    5969
+  ...
+# dumpsys meminfo com.miui.home | grep mtrack
+   EGL mtrack     2696
+    GL mtrack    82140
+```
+
+日志里 `fopen ... fail` 归零。
 
 ### 8.3 Tiler heap 反复回收（有两种成因，先分清）
 

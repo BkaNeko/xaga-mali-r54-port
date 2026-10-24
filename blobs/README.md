@@ -29,7 +29,7 @@
 |---|---|---|
 | `/vendor_dlkm/lib/modules/ged.ko` | 2,028,912 | `c5c26e9a9d93` |
 | `/vendor_dlkm/lib/modules/gpueb.ko` | 183,752 | `f9a1cdf3e603` |
-| `/vendor_dlkm/lib/modules/mali_kbase_mt6895.ko` | 2,568,256 | `4d17c5f50935` |
+| `/vendor_dlkm/lib/modules/mali_kbase_mt6895.ko` | 2,571,656 | `c9909233f442` |
 | `/vendor_dlkm/lib/modules/mali_mgm.ko` | 28,704 | `45833415252c` |
 | `/vendor_dlkm/lib/modules/mali_prot_alloc.ko` | 24,240 | `3580df6a568f` |
 

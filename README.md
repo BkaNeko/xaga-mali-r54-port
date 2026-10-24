@@ -75,6 +75,7 @@ docs/
   PORTING.zh-CN.md                完整移植文档（576 行，27 节）
   FLASHABLE-SUPER.zh-CN.md        把它打成可刷入的 super.img（真实 ROM 实测，含 9 个坑与 r54 专有开关）
 tools/
+  build-mali-ko.sh                重编 mali_kbase_mt6895.ko（含 memtrack 所需宏与 strip 步骤）
   gpueb_patch.py                  生成 950 MHz 的 GPUEB 固件（5 字节补丁）
   gtprobe.c                       gpufreq 域/OPP 提交探针内核模块
   glbench.c                       GLES2 填充率 / 提交开销测量
