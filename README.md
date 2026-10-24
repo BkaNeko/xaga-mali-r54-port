@@ -73,6 +73,7 @@ patches/
     csf/ipa_control/mali_kbase_csf_ipa_control.c       IPA 频率来源
 docs/
   PORTING.zh-CN.md                完整移植文档（576 行，27 节）
+  FLASHABLE-SUPER.zh-CN.md        把它打成可刷入的 super.img（真实 ROM 实测，含 9 个坑与 r54 专有开关）
 tools/
   gpueb_patch.py                  生成 950 MHz 的 GPUEB 固件（5 字节补丁）
   gtprobe.c                       gpufreq 域/OPP 提交探针内核模块
@@ -237,6 +238,7 @@ kbase 内置 DVFS（唯一决策源）
 
 详见 [
 docs/PORTING.zh-CN.md              移植步骤（只讲怎么做）
+docs/FLASHABLE-SUPER.zh-CN.md      整包移植：怎么产出能直接 fastboot flash 的 super.img
 
 ### gpueb 模式下 OPP 表来自固件
 
