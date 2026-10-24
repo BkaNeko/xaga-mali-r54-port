@@ -147,8 +147,12 @@ pm list features | grep -E 'vulkan.(version|deqp)'  # 4206592 / 132711169
   `shiftedPos / scaledRadius` 会除零出 NaN —— NaN 的走向决定"透明"还是"整块压暗"。
 - 因此方向是 r54 的 math/精度或 AFBC 行为让 SDF 掩码失效，可用第 6 节的 DFC 开关做 A/B。
 
-（该材质的 `SOFT_LIGHT` 混合其实是 SystemUI 侧 `BlendModeToken` 下发的，走 hwui 的 MiBlend AGSL，
-与 `GL_KHR_blend_equation_advanced` 无关；隐藏该扩展对这种走 MiGlass 的面板无效。）
+（该材质的 `SOFT_LIGHT` 混合其实是 SystemUI 侧 `BlendModeToken` 下发的，与
+`GL_KHR_blend_equation_advanced` 无关。**更关键的一点**：这台 ROM 的界面渲染已经跑在
+Impeller 上——`dumpsys gfxinfo <pkg>` 里明确写着 `Pipeline=Impeller (Vulkan)`。
+也就是说 GL 层的一切开关（隐藏扩展、GL 的 DFC/`GLES_*`）对桌面/SystemUI 的绘制**根本不起作用**，
+排查方向只能落在 Vulkan 侧（device feature、内存类型、SDF 着色器精度）。
+早期"隐藏 `GL_KHR_blend_equation_advanced`"的思路因此作废，脚本里也改成了默认不改驱动。）
 
 ### 8.2 memtrack 拿不到显存（已修复）
 
@@ -222,8 +226,9 @@ mali_kbase_mt6895.ko
 insmod|/vendor_dlkm/lib/modules/mali_kbase_mt6895.ko large_page_conf=on
 ```
 
-实测（xaga / G610）：参数生效、GPU 正常、无 fault、无崩溃；但那是"在不受支持的 GPU 上强开"，
-**建议只作为实验开关**，默认保持 `auto`，要长期用得先确认大页在该硬件上真的安全。
+实测（xaga / G610）：参数生效（`/sys/module/mali_kbase_mt6895/parameters/large_page_conf`
+读到 `on`）、GPU 正常、无 fault、无崩溃；`Tiler heap reclaim` 日志仍会出现（开机 3 分钟 6 次），
+**收益未量化**。当前产物默认 `--large-page on`，想保守可用 `--large-page auto`（走硬件检查，即原厂默认）。
 
 ## 9. 刷写与回滚
 
@@ -237,3 +242,13 @@ $FB flash gpueb_a        <底包>/firmware/gpueb_stock.bin
 ```
 
 AVB 不处理：底包本身以 `--disable-verity` 刷入、vbmeta 校验值早已不匹配，沿用同样刷法即可。
+
+## 10. 工具链分工
+
+| 环节 | 在哪 | 做什么 |
+|---|---|---|
+| 重编 kbase | 本仓库 `tools/build-mali-ko.sh` | 用 `KDIR` 指的内核树编 `mali_kbase_mt6895.ko`：补 `-DCONFIG_MALI_MTK_PROC_FS/-DCONFIG_MALI_MTK_MEMTRACK`、`KBUILD_MODPOST_WARN=1`、`-Wno-error=*`，最后 `llvm-strip --strip-debug`（46 MB → 2.57 MB）。产物放进 `blobs/vendor_dlkm/` |
+| 打可刷镜像 | ROM 工程里的 `scripts/mali_r54_port.py` | 解底包 super → 注入 payload → 重建 vendor/vendor_dlkm → 重打 super；顺带做 `.ko` 的 vermagic 改写、`cancel_work → cancel_work_sync` 符号改指、`large_page_conf` 加载参数、把 kbase 从 `modules.load` 摘除、属性改标签等 |
+| 验收 | 本文第 7 节 | 设备端逐项核对 |
+
+即：**换 kbase 只动 `blobs/` + 跑一遍打包脚本**，其余（payload、标签、参数）都由打包脚本保证。
