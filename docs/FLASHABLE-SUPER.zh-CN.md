@@ -152,13 +152,44 @@ pm list features | grep -E 'vulkan.(version|deqp)'  # 4206592 / 132711169
 
 ### 8.2 memtrack 拿不到显存
 
-r54 kbase 不再导出 `/proc/mtk_mali/gpu_memory` 与 `/proc/mali/memory_usage`，`dumpsys meminfo` 的
-GPU 内存为 0。属统计缺失（LMK 少一份参考），不影响渲染。
+r54 kbase 只在 **debugfs** 暴露显存统计（`kbasep_gpu_memory_debugfs_init` → `/sys/kernel/debug/mali0/gpu_memory`），
+而 MTK 的 memtrack HAL 只读 `/proc/mtk_mali/gpu_memory` 和 `/proc/mali/memory_usage`，两个 `fopen` 都失败，
+`dumpsys meminfo` 的 GPU 内存为 0。
 
-### 8.3 Tiler heap 反复回收
+纯镜像层面**修不了**，两条路都要动镜像之外的东西：
 
-模块未开 `CONFIG_LARGE_PAGE_SUPPORT`，dmesg 会出现
-`Tiler heap reclaim scan freed pages: N (unused: N)`，有一定 GPU 性能损失，需重编模块才能根治。
+- 在 kbase 里加回 MTK 的 `/proc/mtk_mali/gpu_memory`（需要 ARM r54 源码 + 目标内核源码重编）；
+- 或挂 debugfs + 给 memtrack 域补 `debugfs` 读权限（需要重编 sepolicy）。
+
+影响面：只丢统计（LMK 少一份参考），不影响渲染与频率。
+
+### 8.3 Tiler heap 反复回收（有两种成因，先分清）
+
+dmesg 里的 `Tiler heap reclaim scan freed pages: N (unused: N)` 只是**结果**，成因有二：
+
+1. 编译期没开大页支持 —— 日志会明确写 `Large page support was disabled at compile-time`；
+2. **编译进来了但硬件特性检查判 false** —— 日志写
+   `Large page allocation set to false after hardware feature check`（本包就是这种）。
+
+第二种可以用模块参数救，不用重编。`large_page_conf` 的取值是从模块里反汇编出来的
+（`set_large_page_conf`）：`auto` = 走硬件检查、`on` = 强制打开、`off` = 强制关闭；
+强制打开时会打印 `Enabling large page allocations on unsupporting GPU!`。
+
+**坑**：`/vendor_dlkm/lib/modules/modules.load` 里本来就有 `mali_kbase_mt6895.ko`，
+而 `init.insmod.mt6895.cfg` 第一条是 `modprobe|*` —— 它会把 modules.load 里所有模块
+**不带参数**先加载一遍，之后你写的 `insmod ... large_page_conf=on` 只会 `File exists`，
+参数永远不生效（`/sys/module/mali_kbase_mt6895/parameters/large_page_conf` 仍是 `off`）。
+要生效必须先把 kbase 从 `modules.load` 摘掉，让带参数的那条 insmod 成为唯一加载者：
+
+```bash
+# modules.load 删掉这一行
+mali_kbase_mt6895.ko
+# init.insmod.mt6895.cfg 里给 insmod 行加参数（init.insmod.sh 用未加引号的 insmod $arg，可直接带参）
+insmod|/vendor_dlkm/lib/modules/mali_kbase_mt6895.ko large_page_conf=on
+```
+
+实测（xaga / G610）：参数生效、GPU 正常、无 fault、无崩溃；但那是"在不受支持的 GPU 上强开"，
+**建议只作为实验开关**，默认保持 `auto`，要长期用得先确认大页在该硬件上真的安全。
 
 ## 9. 刷写与回滚
 
