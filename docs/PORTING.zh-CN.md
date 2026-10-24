@@ -201,14 +201,19 @@ for root, _, files in os.walk(NEW):
 
 ## 5. gpueb 950MHz（可选）
 
+> 完整前因后果（固件表结构、AP 三条路为什么堵死、数学佐证、调度侧连带修的三个问题、
+> 实际收益）见 [950MHZ.zh-CN.md](950MHZ.zh-CN.md)。
+
 GPUEB 是 RISC-V 协处理器，GPU 频率由它决定。其 GPU OPP 表在偏移 `0x15d60`，
 6 项 × 24 字节，950MHz 在 index 0，但固件选档循环边界是 `i > 0`，
 **index 0 永远选不到**，实际最高只到 index 1（880MHz）。
 
+950 MHz 用 **787.5 mV**（表里 78750，单位 0.1 mV），和原厂 880 档同压。
+
 把 index 1 改成 950MHz 即可解锁：
 
 ```bash
-python3 tools/gpueb_patch.py gpueb.img gpueb_950.img
+python3 tools/gpueb_patch.py gpueb.img gpueb_950.img --pad-to 1048576
 # 等价于：0x15d78 起 880000 -> 950000，0x15d80 起 75000 -> 78750
 ```
 

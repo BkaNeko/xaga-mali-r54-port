@@ -237,9 +237,10 @@ kbase 内置 DVFS（唯一决策源）
 | 4 | **`TARGET_GPU` 提交在 gpueb 模式下无效** | `ret=0` 但频率不变 |
 | 5 | 打印 `mtk_opp_freq[5]` 但只有 5 档 | 启动日志垃圾数据 |
 
-详见 [
+详见：
 docs/PORTING.zh-CN.md              移植步骤（只讲怎么做）
 docs/FLASHABLE-SUPER.zh-CN.md      整包移植：怎么产出能直接 fastboot flash 的 super.img
+docs/950MHZ.zh-CN.md               950MHz：固件表、AP 侧为什么碰不到、连带修的调度问题
 
 ### gpueb 模式下 OPP 表来自固件
 
