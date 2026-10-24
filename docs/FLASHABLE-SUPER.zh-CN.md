@@ -158,7 +158,19 @@ r54 kbase 只在 **debugfs** 暴露显存统计（`kbasep_gpu_memory_debugfs_ini
 
 纯镜像层面**修不了**，两条路都要动镜像之外的东西：
 
-- 在 kbase 里加回 MTK 的 `/proc/mtk_mali/gpu_memory`（需要 ARM r54 源码 + 目标内核源码重编）；
+- 在 kbase 里加回 MTK 的 `/proc/mtk_mali/gpu_memory`：**源码其实已经在** r54 树里
+  （`platform/mtk_platform_common/mtk_platform_memtrack.c`，输出格式
+  `  kctx-0x%p %10u %10u` 正好对上 HAL 的 `fscanf(fp, "  %*s %ld %u\n", ...)`），
+  只是 mt6895 分支没打开开关。要做的就是在这棵树里补：
+  ```make
+  # gpu/arm/midgard/Makefile，mt6895 分支
+  CONFIG_MALI_MTK_MEMTRACK := y
+  ```
+  以及让预处理器看到这个宏（`include/generated/autoconf.h` /
+  `include/config/auto.conf`），Kbuild 里已有
+  `ifeq ($(CONFIG_MALI_MTK_MEMTRACK),y) mali_kbase-y += .../mtk_platform_memtrack.o`
+  的现成门控。注意这条会连带 DVFS_POLICY 等 MTK 配置一起要，必须用原厂的完整构建配置重编，
+  不能只挑这一个宏。
 - 或挂 debugfs + 给 memtrack 域补 `debugfs` 读权限（需要重编 sepolicy）。
 
 影响面：只丢统计（LMK 少一份参考），不影响渲染与频率。
