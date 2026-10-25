@@ -1,0 +1,6 @@
+id=r54_mali
+name=Mali r54p1 (qqcandy / MT6895)
+version=v1.0
+versionCode=1
+author=bkaneko
+description=Systemless Mali r54p1 GPU userspace: libGLES_mali + MEOW + firmware UK1.38 + new libc++ + EGL/gralloc props

@@ -1,0 +1,7 @@
+# KernelSU 元模块 magic_mount_rs 的配置
+# 内核模块不走 overlay（MTK 在 early-init 就 insmod，元模块到 post-fs-data 才挂载），
+# 所以这里不需要额外分区，保持默认列表即可。
+mountsource = "KSU"
+umount = false
+partitions = []
+extra_mount = []

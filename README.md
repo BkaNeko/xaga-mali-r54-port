@@ -8,6 +8,12 @@
 
 > 这是**移植记录仓库**，不是可直接刷入的固件。仓库里放的是补丁、改动后的源文件和验证工具。
 
+**另一台机器**：`qqcandy/` 目录是同一套 r54p1 栈在 **oppo/ossi（MT6895，Android 16，内核 5.10.236）** 上的移植。
+那台机器的落地方式和 xaga 完全不同 —— 内核在 `early-init` 就加载 GPU 模块、OPPO 的安全驱动禁止
+非 recovery 进程写受保护分区，所以内核模块必须写真分区、用户态走 KernelSU 元模块 overlay。
+另外它的 gpueb 固件带 RSA 签名，950 MHz 那套做法在上面用不了。
+详见 [`qqcandy/README.zh-CN.md`](qqcandy/README.zh-CN.md)。
+
 ---
 
 ## 为什么做这件事
