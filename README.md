@@ -74,6 +74,7 @@ patches/
 docs/
   PORTING.zh-CN.md                完整移植文档（576 行，27 节）
   FLASHABLE-SUPER.zh-CN.md        把它打成可刷入的 super.img（真实 ROM 实测，含 9 个坑与 r54 专有开关）
+  GPUEB.zh-CN.md                  13T 固件移植为什么走不通（推翻「架构级死路」，含实机证据与反汇编）
 tools/
   build-mali-ko.sh                重编 mali_kbase_mt6895.ko（含 memtrack 所需宏与 strip 步骤）
   gpueb_patch.py                  生成 950 MHz 的 GPUEB 固件（5 字节补丁）
@@ -241,6 +242,7 @@ kbase 内置 DVFS（唯一决策源）
 docs/PORTING.zh-CN.md              移植步骤（只讲怎么做）
 docs/FLASHABLE-SUPER.zh-CN.md      整包移植：怎么产出能直接 fastboot flash 的 super.img
 docs/950MHZ.zh-CN.md               950MHz：固件表、AP 侧为什么碰不到、连带修的调度问题
+docs/GPUEB.zh-CN.md                13T 固件移植：核实与收尾（三层原因，含 LK 镜像表对比）
 
 ### gpueb 模式下 OPP 表来自固件
 
