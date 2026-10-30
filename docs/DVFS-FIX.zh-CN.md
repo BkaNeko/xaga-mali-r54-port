@@ -357,32 +357,16 @@ ext4 remount + cp 同一个 `mtk_platform_dvfs.c` 重编出的模块，vermagic 
 
 ---
 
-# 附录 A：为什么 xaga 的 commit 路径无效（静态分析）
+# 附录 A：commit 与 fix 的状态机完整推导
 
-## A.1 「ret=0 但档位不动」的出处
+> **本附录推翻了早前的一个结论。**
+> 早前记录为「xaga 的固件无视 commit，FIX 是唯一控制面」——那个结论是**在 GPU 已下电的
+> 空载状态下测出来的**，测得的是假象。下面是完整推导和证据。
 
-`gpufreq_mt6895.c` 里 `__gpufreq_generic_commit_stack()` 的第一道门（约 1040 行）：
-
-```c
-int __gpufreq_generic_commit_stack(int target_oppidx, enum gpufreq_dvfs_state key)
-{
-	...
-	mutex_lock(&gpufreq_lock);
-
-	/* check dvfs state */
-	if (g_dvfs_state & ~key) {
-		GPUFREQ_LOGD("unavailable DVFS state (0x%x)", g_dvfs_state);
-		ret = GPUFREQ_SUCCESS;      /* ← 静默丢弃，返回 0 */
-		goto done_unlock;
-	}
-	...
-```
-
-`key` 不是"要设置成什么状态"，而是**"这次提交允许在哪些 dvfs_state 位下才生效"的掩码**。
-状态定义（`gpufreq_v2.h`）：
+## A.1 状态变量：`g_dvfs_state`
 
 ```c
-enum gpufreq_dvfs_state {
+enum gpufreq_dvfs_state {          /* gpufreq_v2.h */
 	DVFS_FREE        = 0,
 	DVFS_DISABLE     = 1 << 0,   /* 0x01 */
 	DVFS_POWEROFF    = 1 << 1,   /* 0x02 */
@@ -392,82 +376,178 @@ enum gpufreq_dvfs_state {
 };
 ```
 
-对照两种调用：
+全生命周期只有这几处改动它（`gpufreq_mt6895.c`）：
 
-| 路径 | 前置动作 | 提交时的 `key` | 门判据 |
+| 行 | 触发 | 动作 | 时机 |
 |---|---|---|---|
-| 普通 `gpufreq_commit()` | 无 | `DVFS_FREE` (=0) | `g_dvfs_state & ~0` = `g_dvfs_state`，**只要状态非 0 就丢弃** |
-| `gpufreq_fix_target_oppidx()` | 先 `__gpufreq_set_dvfs_state(true, DVFS_DEBUG_KEEP)` | `DVFS_DEBUG_KEEP` (=4) | `g_dvfs_state & ~4`，状态为 4 时通过 |
+| 3743 | 初始化，DVFS 被关 | `= DVFS_DISABLE` | 开机一次 |
+| 3756 | 初始化，DVFS 开启 | `= DVFS_FREE` | 开机一次 |
+| 3805 | `__gpufreq_pause_dvfs()` | `\|= DVFS_AGING_KEEP` | 老化/AVS 校准期间 |
+| 3825 | `__gpufreq_resume_dvfs()` | `&= ~DVFS_AGING_KEEP` | 校准结束 |
+| 827 | `__gpufreq_power_control(POWER_ON)` | `&= ~DVFS_POWEROFF` | GPU 上电 |
+| 832 | `__gpufreq_power_control(POWER_OFF)` | `\|= DVFS_POWEROFF` | GPU 下电 |
+| 1163 | `fix_target_oppidx(idx>=0)` | `\|= DVFS_DEBUG_KEEP` | 调用 fix |
+| 1160 | `fix_target_oppidx(-1)` | `&= ~DVFS_DEBUG_KEEP` | 调用 fix(-1) |
 
-所以 xaga 上「ret=0 但 STACK/GPU 档位纹丝不动」不是失败，
-**是固件按设计把这个请求当成"当前状态不允许"而静默丢弃并返回成功**。
+老化/AVS 只在初始化跑一次且 resume 会清位，所以开机之后只剩三种可能：
 
-## A.2 为什么 corot 没这个问题
+- **GPU 上电运行中：`0x0`**
+- **GPU 下电空闲：`0x2`**（POWEROFF）
+- 调用过 fix：多一个 `0x4`，只有 `fix(-1)` 能清
 
-两个 gpueb 固件是同族（RV33，payload 都以 `6f 00 c0 0a` 开头、都嵌了同一份 MTK gpufreq v2 代码，
-连 `gpufreq_ipi_handler` / `gpu_fdvfs_ipi_handler` / `invalid IPI cmd: %d` 这些字符串都一模一样），
-但**构建内容差很多**：
+`/proc/gpufreqv2/gpufreq_status` 里那行 `DVFSState: 0x%04x` 走
+`gpufreq_get_dvfs_state()`，EB 模式下读的就是**固件 shared_status 里的同一个变量**。
 
-| | xaga | corot |
-|---|---|---|
-| 固件文件 | 131,072 B（原版） | 430,080 B |
-| payload | 126,764 B | 421,688 B |
-| 独有可读字符串 | 31 条 | **551 条** |
-| 是否含 `middleware/gpu_fastdvfs/mt6895/src/fast_dvfs_ipi.c` | **否** | **是** |
+## A.2 提交门
 
-corot 多出来的是 **GPU fast-DVFS IPI 中间件**。`CMD_COMMIT` 在 corot 上由这层中间件直接应用，
-不经过 embedded gpufreq 的 `g_dvfs_state` 门；xaga 没有这层，`CMD_COMMIT` 落到 embedded
-gpufreq 的 commit，被 A.1 那道门吃掉。
-
-**结论：这是固件构建差异，不是驱动代码差异。**
-xaga 上没有任何驱动侧改动能把 commit 变生效——`CMD_FIX_TARGET_OPPIDX` 是唯一可用的控制面。
-
-## A.3 FIX 的两个副作用（必须处理）
-
-### 副作用 1：用过 FIX 之后，普通 commit 永久失效
-
-FIX 会把 `g_dvfs_state` 置成 `DVFS_DEBUG_KEEP`(0x4)。此后普通 commit 的 `key=0`，
-`0x4 & ~0 = 0x4 ≠ 0` → 每次都被门吃掉。要么**全程只用 FIX**，要么先发一次
-`gpufreq_fix_target_oppidx(TARGET_DEFAULT, -1)` 把状态清回 `DVFS_FREE`。
-
-### 副作用 2：FIX 绕过限频器 → thermal 失效（危险）
-
-`__gpufreq_generic_commit_stack()` 内部**不套用 ceiling/floor**，它只做：
-校验下标 → 过状态门 → 直接 `__gpufreq_scale_gpu()` 应用。
-
-限频器（thermal / 电池 / fpsgo）是在上层 `limited_commit` 里套的，而 `gpufreq_fix_target_oppidx()`
-走的是 `fix_target_oppidx_stack()`，直接调 `generic_commit_stack()`，**完全不经过限频器**。
-
-也就是说：只用 FIX 当控制面，GPU 会被钉在你给的档位，**温度再高也不会降**。
-
-**补救（已实现）**：策略自己把目标钳进当前生效的 ceiling。
+`__gpufreq_generic_commit_stack()`（1040 行附近）：
 
 ```c
-	/* gpufreq_get_cur_limit_idx 在 EB 模式下读的是固件 shared_status 里
-	 * 汇总完所有 limiter 之后的 cur_ceiling_stack / cur_floor_stack。 */
-	{
-		int ceil_idx = gpufreq_get_cur_limit_idx(TARGET_STACK, GPUPPM_CEILING);
+	mutex_lock(&gpufreq_lock);
 
-		if (ceil_idx >= 0 && target < ceil_idx) {
-			pr_info_ratelimited("GDBG: target %d over ceiling %d, clamped\n",
-				target, ceil_idx);
-			target = ceil_idx;
-		}
+	/* check dvfs state */
+	if (g_dvfs_state & ~key) {
+		GPUFREQ_LOGD("unavailable DVFS state (0x%x)", g_dvfs_state);
+		ret = GPUFREQ_SUCCESS;      /* 静默丢弃，返回 0 */
+		goto done_unlock;
 	}
 ```
 
-下标越小频率越高，所以钳位方向是 `target = max(target, ceiling)`。
-`cur_ceiling_stack` 已经是 max(SEGMENT, THERMAL_AP, THERMAL_EB, SRAMRC, BATT_OC, BATT_PERCENT,
-LOW_BATT, PBM, APIBOOST, FPSGO) 的结果，钳一次就够。
+`key` 不是"要设置成什么状态"，而是 **"这次提交允许在哪些状态位下生效"的掩码**。
+判据是 `g_dvfs_state & ~key`：
 
-## A.4 xaga 验收
+| 调用方 | `key` | 判据化简 | 结果 |
+|---|---|---|---|
+| 普通 commit | `DVFS_FREE`(0) | `g_dvfs_state` | **只要状态非 0 就丢弃** |
+| fix | `DVFS_DEBUG_KEEP`(4) | `g_dvfs_state & ~4` | 状态 ≤0x4 时通过 |
+
+普通 commit 的 key 来自 `gpuppm_limited_commit()`（`gpuppm.c:533`）：
+
+```c
+	if (target == TARGET_STACK)
+		ret = __gpufreq_generic_commit_stack(limited_idx, DVFS_FREE);
+	else
+		ret = __gpufreq_generic_commit_gpu(limited_idx, DVFS_FREE);
+```
+
+## A.3 两条完整链路
+
+### 普通 commit（`gpufreq_commit`）
 
 ```
-dmesg | grep GDBG
-#  期望：dom 走 FIX，cur= 跟随 target（不再冻结）
-#  出现 "over ceiling" 说明 thermal 钳位在起作用（这是好事）
-
-cat /proc/gpufreqv2/gpufreq_status
-#  空载 [GPU-OPP] 落到 5（350）
-#  压负载 ramp 过程中经过 2/3/4（800/610/430）
+策略 → gpufreq_commit(TARGET_DEFAULT, idx)
+  └ gpufreq_validate_target(): dual_buck=True → TARGET_STACK
+  └ EB: IPI cmd 7 (CMD_COMMIT)
+      └ 固件 gpufreq_ipi_handler → limited_commit(STACK, idx)
+          └ 按 [ceiling, floor] 钳位        ← 限频器在这里生效
+          └ __gpufreq_generic_commit_stack(limited_idx, DVFS_FREE)
+              └ 状态门：g_dvfs_state & ~0 = g_dvfs_state
+                  ├ 上电中(0x0) → 通过 → 应用
+                  └ 下电中(0x2) → 丢弃，返回 0
 ```
+
+### fix（`gpufreq_fix_target_oppidx`）
+
+```
+策略 → gpufreq_fix_target_oppidx(TARGET_DEFAULT, idx)
+  └ EB: IPI cmd 14 (CMD_FIX_TARGET_OPPIDX)
+      └ 固件 __gpufreq_fix_target_oppidx_stack(idx)
+          └ __gpufreq_power_control(POWER_ON)      ← 先强制上电，清掉 0x2
+          └ __gpufreq_set_dvfs_state(true, DVFS_DEBUG_KEEP)   ← 状态变 0x4
+          └ __gpufreq_generic_commit_stack(idx, DVFS_DEBUG_KEEP)
+              └ 状态门：0x4 & ~0x4 = 0 → 通过
+          └ __gpufreq_power_control(POWER_OFF)
+```
+
+注意 fix **不经过 `limited_commit`**，直接调 `generic_commit_stack`，
+所以 ceiling/floor 完全被跳过。
+
+## A.4 由此得到三个结论
+
+### 结论 1：空载时 commit 必然无效，这是设计
+
+GPU 下电 → `g_dvfs_state = 0x2` → 普通 commit 的 key 是 `DVFS_FREE`(0) →
+`0x2 & ~0 ≠ 0` → **丢弃并返回 0**。
+
+这不是 xaga 的固件特性，**任何设备在空载下电时都一样**。
+而且此刻 GPU 本来就没在跑，`[GPU-REALOPP] FmeterFreq: 0`，改档位也没有意义。
+
+### 结论 2：早前「xaga 固件无视 commit」是测量假象
+
+那份证据是「20 秒空载采样，GPU-OPP 恒为 1（950）」。而同一份 status 里：
+
+```
+[GPU-Power]  PowerCount: 0, CG: 0, MTCMOS: 0, BUCK: 0     ← GPU 没上电
+[GPU-REALOPP] FmeterFreq: 0, Con1Freq: 0                  ← 实测频率 0
+[Common-Status] DVFSState: 0x0002                          ← 就是 POWEROFF
+```
+
+`GPU-OPP Index` 是**上一次成功提交留在 shared_status 里的目标值**，不是当前正在跑的频率。
+所以「钉死 950」= 最后一次成功提交发生在 GPU 还醒着的时候，值是 950；之后所有降档提交都被门吃掉了。
+
+反证在同一份记录的别处：策略日志里出现过 `cur=4`（430MHz），
+commit 在 `4->2 / 4->0 / 4->3 / 4->1` 之间来回，说明**频率确实在动**。
+
+corot 空载显示 350 也是同一机制：最后一次成功提交恰好是 350。
+
+### 结论 3：用 fix 当策略控制面是错的
+
+fix 能"在空载下生效"的原因恰恰是它 `POWER_ON` 强制上电。如果拿它当每 40ms 一次的
+调频手段，会带来三个问题：
+
+1. **绕过限频器** —— thermal / 电池 / fpsgo 全部失效，GPU 会被钉死在请求档位；
+2. **反复强制上电** —— 每拍 POWER_ON/POWER_OFF，功耗和时序都不对；
+3. **`DVFS_DEBUG_KEEP` 永久置位** —— 之后普通 commit 再也无法生效（`0x4 & ~0 ≠ 0`），
+   只有显式 `fix(-1)` 能清。
+
+**正确做法：继续用 commit。** 验证时必须在**有负载、`FmeterFreq > 0`** 的条件下采样，
+否则测到的全是下电残留值。
+
+## A.5 那 xaga 上到底还剩什么问题
+
+如果 commit 在负载下是好的，剩下的现象就是：
+
+> 降档提交往往**赶在 GPU 下电之后**到达，被门丢掉，于是 shared_status 里保留的是
+> 上一次较激进的目标值（950）。下次上电时 GPU 从高档起步，功耗偏高。
+
+这不是"调频坏了"，而是"最后一步没落地"。两种处理：
+
+- **A**：策略在检测到 `util≈0` 时，**赶在 GPU 下电前**把目标提交下去
+  （现在的 `down_ticks < 8` + `hold_ticks=5` 加起来约 0.5 秒，可能太慢）；
+- **B**：接受它——上电路径本身会用 `SRAMRC` / `GPUFREQ_SAFE_VLOGIC` 重新选档
+  （`__gpufreq_init_opp_idx`），不依赖残留值。
+
+需要实机确认是哪一种，判据见 A.6。
+
+## A.6 实机验证判据（必须带负载）
+
+```bash
+# 判据 1：GPU 必须是醒的（否则一切读数无意义）
+adb shell 'su -c "cat /proc/gpufreqv2/gpufreq_status"' | grep -E "REALOPP|DVFSState|GPU-OPP"
+#   要求：FmeterFreq > 0 且 DVFSState 不含 0x0002
+
+# 判据 2：commit 是否真的生效（带负载）
+adb shell 'su -c "
+  /data/local/tmp/glbench 1920 1080 40000 >/dev/null 2>&1 &
+  for i in \$(seq 1 20); do
+    grep -E \"GPU-OPP|REALOPP\" /proc/gpufreqv2/gpufreq_status
+    sleep 1
+  done"'
+#   要求：GPU-OPP 的 Index 会变，且 REALOPP.FmeterFreq 跟着变
+
+# 判据 3：dmesg 里只要出现 "unavailable DVFS state"（需要开 GPUFREQ_LOGD）
+#   就说明还有提交被门吃掉
+```
+
+## A.7 本推导里唯一没有直接证据的一环
+
+「固件把 cmd 7 路由到 `limited_commit`」是从 **AP 侧同源代码**推的：
+固件里嵌了同一份 gpufreq v2（`gpufreq_ipi_handler`、`__gpufreq_generic_commit_stack`、
+`invalid IPI cmd: %d` 等字符串在两份固件里完全一致）。
+
+要直接证明，需要在固件里定位 `gpufreq_ipi_handler` 的 cmd 分发表。
+RV33 payload 是未压缩的 RISC-V 代码，可反汇编，但 0x200 处不是代码起点（前面有段表），
+需要先定位代码段基址。这是本次未完成的部分。
+
+**不过 A.6 的判据 2 可以替代它**：如果带负载时 `FmeterFreq` 跟随 `GPU-OPP`，说明
+commit 链路是通的，上面这个未经证实的环节也就无关紧要了。
