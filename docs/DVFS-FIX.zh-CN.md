@@ -639,3 +639,85 @@ mtk_rpmsg_mbox → mtk_tinysys_ipi → gpueb → mtk_gpufreq_wrapper
 
 **下一步正解**：拿一份流水线产出的可开机镜像，和手工镜像做二进制 diff，
 差异点就是根因所在。在那之前不要在 xaga 上手工重打包 vendor_dlkm。
+
+---
+
+# 附录 C：xaga 实机验证结果（2026-10-30，已通过）
+
+## C.1 结论
+
+**`gpufreq_commit` 在 xaga 上是有效的。** 早前「xaga 固件无视 commit」的结论是错的，
+原因见附录 A（空载时 GPU 下电、状态门按设计丢弃提交；叠加调过 fix 之后
+`DVFS_DEBUG_KEEP` 永久置位把 commit 彻底堵死）。改用 commit 路径后实测：
+
+| 判据 | 结果 |
+|---|---|
+| 负载时实际频率 | **949914 / 950117 / 950015 kHz**（`GPU-REALOPP.FmeterFreq`，非残留值） |
+| 负载时 STACK | 852000 kHz |
+| 负载时 `DVFSState` | **0x0000**（无 POWEROFF、无 DEBUG_KEEP） |
+| 空载 | `gpu_idx=5`、`stack=219000`、`DVFSState=0x0002` → **回落到 350MHz** |
+| 中间档 | 策略提交过 target 0/1/2/3/4 各若干次，`cur` 实测出现过 **4(430) / 3(610) / 2(800)** |
+| 限频器 | `limit_table` 里 THERMAL_AP / FPSOG / SEGMENT 均在，**thermal 未被绕过** |
+
+## C.2 ramp 实测波形（200ms 采样）
+
+```
+ramp up : 5/350085 ×9 → 5/350085 → 1/950015 ×2 → ...
+稳定负载: 5/349984 → 1/949914 → 1/950015 ...
+ramp down: 1/950015 → 5/349984 → 5/0 ...
+```
+
+空载↔满载之间会直接跨到 950，中间档只在策略目标落到 2/3 时才短暂停留。
+原因是 glbench 的利用率在 100 和低值之间跳变，策略的 2 拍上升/8 拍下降迟滞
+把它推成两端摆动。**这不是链路问题**，`cur` 出现过 4/3/2 已经说明中间档可达。
+
+## C.3 装机配置
+
+```
+模块: mali_kbase_mt6895.ko  2,574,312 B  md5 159dcae3adb3d9e77367f0fb51c608f5
+      vermagic=5.10.226-android12-9-ga738ee7cbe68（流水线自动改写）
+镜像: out/repacked/vendor_dlkm.img  22,953,984 B（含 AVB footer）
+```
+
+---
+
+# 附录 D：正确的 vendor_dlkm 打包方式（已验证可开机）
+
+**不要手工 `mkfs.erofs` + dd。** 用项目自带流水线，三步：
+
+```bash
+cd /home/bkaneko/new-port
+
+# 1) 把新模块放进 payload（流水线会自动改写 vermagic）
+cp <你的.ko> payload/xaga_r54/vendor_dlkm/lib/modules/mali_kbase_mt6895.ko
+
+# 2) 应用到 dna 树（需要 root，dna 树属主是 root）
+sudo python3 -u -m mtkport.patches.xaga_r54 out/dna -o out/dna --no-backup
+
+# 3) 重建 + AVB 签名（只做 vendor_dlkm）
+sudo python3 build.py rebuild --parts vendor_dlkm
+sudo python3 build.py avb-sign --parts vendor_dlkm
+```
+
+产物：`out/repacked/vendor_dlkm.img` — 22,953,984 字节，尾部有 `AVBf` footer。
+
+写入（adb 可用时，不用进 recovery）：
+
+```bash
+adb push out/repacked/vendor_dlkm.img /data/local/tmp/
+adb shell 'su -c "dd if=/data/local/tmp/vendor_dlkm.img \
+  of=/dev/block/by-name/super bs=512 seek=12130304 conv=fsync; sync"'
+adb reboot
+```
+
+`vendor_dlkm_a` 的 extent 起始扇区用 `lpdump /dev/block/by-name/super | grep -A4 "Name: vendor_dlkm_a"` 查，
+本次是 **12130304**。
+
+## D.1 为什么手工打包会卡开机（补充附录 B）
+
+手工 `mkfs.erofs` 打出来是 **22,507,520 字节、没有 AVB footer**；
+流水线 `avb-sign` 会把它 **padding 到分区满大小 22,953,984 并在最后 64 字节写 `AVBf`**。
+缺了这段，开机时模块加载会级联缺席（180/202），GPU 链断掉 → surfaceflinger 无限重启 → 卡一。
+
+另外流水线用的是 **`tools/linux/x86_64/mkfs.erofs.aosp`**（AOSP 分支），不是系统自带的
+erofs-utils 1.8.6——后者不支持 `--fs-config-file` / `--file-contexts`，属主和 SELinux 标签都写不进去。
