@@ -890,3 +890,59 @@ static unsigned int mtk_policy_enable_param = 0;
 - **频率由固件 governor 决定**（350 ↔ 950）
 - **AP 侧零开销**，不再和固件抢
 - 下电钩子保留，保证 shared_status 里的残留值不会停在高档
+
+---
+
+# 附录 G：自建调度（fix 执行器）尝试与失败原因
+
+## G.1 思路
+
+既然 `commit` 推不动固件（附录 F：固件自带 governor 会覆盖），而 `fix_target_oppidx`
+实测能真正锁住档位（`fix STACK 39 → GPU 稳定 350，跨上电周期保持`），
+那就用 fix 当执行器 + 自己做决策（阶梯爬坡），并在每次调用前按 `cur_ceiling_stack` 钳位
+保住 thermal。
+
+## G.2 实测结果：三个硬伤，不可行
+
+```
+空闲:   2/0        ← 残留 800MHz，不是最低档
+满载:   1/950015   ← 直接跳到顶，没有台阶
+停载后: 1/0        ← 残留 950，老毛病回来了
+```
+
+### 硬伤 1：fix 每次调用都强制 POWER_ON
+
+`__gpufreq_fix_target_oppidx_stack()` 入口是：
+
+```c
+ret = __gpufreq_power_control(POWER_ON);
+...
+ret = __gpufreq_generic_commit_stack(oppidx, DVFS_DEBUG_KEEP);
+__gpufreq_power_control(POWER_OFF);
+```
+
+策略 40ms 一拍，等于**每 40ms 把已经下电的 GPU 拉起来一次再关掉**。功耗和时序都不对。
+
+### 硬伤 2：DEBUG_KEEP 会把下电钩子毒死
+
+fix 置上 `DVFS_DEBUG_KEEP(0x4)` 之后，`g_dvfs_state = 0x6`（POWEROFF|DEBUG_KEEP），
+而 `mtk_dvfs_commit_idle()` 用的是 `gpufreq_commit()`，key 是 `DVFS_FREE(0)`：
+
+```
+0x6 & ~0 = 0x6 ≠ 0  → 被状态门丢弃
+```
+
+于是下电钩子彻底失效，残留值停在最后一次 fix 的高档上——「一直保持 950」原样复现。
+
+### 硬伤 3：还是不爬坡
+
+日志里只有 `2->1`、`1->0` 这种跳变，因为固件 governor 在同一拍里已经把频率顶到 950，
+策略读到的 `cur` 就是 0，无档可升。
+
+## G.3 结论
+
+**xaga 上自建调度不成立。** 唯一的执行器（fix）自带 POWER_ON 和 DEBUG_KEEP 两个副作用，
+比固件自带 governor 的行为更差。最终形态只能是附录 F.6 那套：**策略关闭，交回固件**。
+
+要在 xaga 上真正实现自建调度，必须改 gpueb 固件里的 governor 本身（RV33 代码），
+那是重写固件，不在可行范围内。
