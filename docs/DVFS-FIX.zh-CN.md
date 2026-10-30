@@ -862,3 +862,31 @@ GDBG: util=100 cur=0 up=0 ...
 - 其余的阈值/EMA/爬坡逻辑在 xaga 上都用不上
 
 corot 那边不受影响：它的固件接受 commit，行为由 AP 策略决定（附录 C 的实测数据）。
+
+## F.6 已实施：默认关闭 AP 策略（实机验收通过）
+
+`mtk_policy_enable_param` 默认值由 1 改为 0：
+
+```c
+static unsigned int mtk_policy_enable_param = 0;
+```
+
+需要接管时仍可临时打开：
+`echo 1 > /sys/module/mali_kbase_mt6895/parameters/mtk_policy_enable`
+
+实机验收（xaga 5.10.257-Kirara）：
+
+```
+1. 空闲          GPU-OPP Index 5 / 350000    STACK-OPP Index 39 / 219000
+2. 满载          950015 ×6（固件 governor 自己给）
+3. 停载回落      350000 / 219000
+4. 策略日志      GDBG: util 行数 = 0         ← 不再每 40ms 空转
+5. 下电钩子      GDBG idle = 192 次          ← 仍然生效
+   commit 行数   = 0                         ← 策略不再提交
+6. DVFSState     0x0002（干净）
+```
+
+最终形态：
+- **频率由固件 governor 决定**（350 ↔ 950）
+- **AP 侧零开销**，不再和固件抢
+- 下电钩子保留，保证 shared_status 里的残留值不会停在高档
