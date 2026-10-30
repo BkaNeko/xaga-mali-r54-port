@@ -453,8 +453,6 @@ static int mtk_up_ticks;
  * 回退到 STACK 域形式。corot 的 STACK 表最高只有 695MHz，走 STACK 域时 GPU 会被
  * __gpufreq_get_hw_constraint_fgpu() 反推到 800MHz 封顶，所以有能力的设备必须
  * 直接提交 GPU 域才能拿到 880/950。 */
-static bool mtk_gpu_domain_ok = true;
-static int mtk_gpu_req = -1;
 /* 同一个档位不重复发 IPI：gpueb 是异步处理，策略每 40ms 重发一次同一个请求只会
  * 白白增加 IPI 流量（实测 index 0 达不到时会一直刷 "2->0"）。改成同档位最多
  * 1 秒重发一次，作为 gpueb 丢包的兜底。 */
@@ -650,6 +648,22 @@ static void mtk_dvfs_apply(unsigned int loading)
 			cur_idx = i;
 			break;
 		}
+	if (cur_idx == mtk_opp_last) {
+		/* raw idx 不在去重映射表里：950 固件补丁让 raw idx 0/1 都是
+		 * 950000，STACK 域反推恰好会落到 idx 1，而映射表只登记了
+		 * idx 0 —— 查不到时若直接落到 mtk_opp_last（350 档），策略
+		 * 会把实际 950 当成 350，此后 util 再低也判为"无需动作"，
+		 * GPU 钉死在最高档不降频（实测）。按当前频率解析到正确的
+		 * 策略档：表按频率降序，第一个 <= 当前频率的就是当前档。 */
+		int freq_khz = gpufreq_get_cur_freq(TARGET_GPU);
+
+		if (freq_khz > 0)
+			for (i = 0; i <= mtk_opp_last; i++)
+				if (mtk_opp_freq[i] <= freq_khz) {
+					cur_idx = i;
+					break;
+				}
+	}
 
 	/* Refresh the rate used to convert GPU_ACTIVE cycles into time. It is
 	 * only updated on a successful commit notification, so a missed one
@@ -660,20 +674,8 @@ static void mtk_dvfs_apply(unsigned int loading)
 	if (!IS_ERR_OR_NULL(kbdev))
 		mtk_common_notify_gpu_freq_change();
 
-	/* 上一次请求走的是 GPU 域：这一拍看实际是否落到那个档位 */
-	if (mtk_gpu_req >= 0 && raw_idx != mtk_gpu_req) {
-		if (mtk_gpu_domain_ok) {
-			mtk_gpu_domain_ok = false;
-			pr_info("GDBG: TARGET_GPU commit is a no-op here "
-				"(asked %d, got %d); fall back to STACK domain\n",
-				mtk_gpu_req, raw_idx);
-		}
-	}
-	mtk_gpu_req = -1;
-
-	pr_info_ratelimited("GDBG: util=%u cur=%d up=%d hold=%d down=%d dom=%s\n",
-		loading, cur_idx, mtk_up_ticks, mtk_hold_ticks, mtk_down_ticks,
-		mtk_gpu_domain_ok ? "GPU" : "STACK");
+	pr_info_ratelimited("GDBG: util=%u cur=%d up=%d hold=%d down=%d dom=FIX\n",
+		loading, cur_idx, mtk_up_ticks, mtk_hold_ticks, mtk_down_ticks);
 
 	/* If GED committed a frequency recently it is driving DVFS itself;
 	 * stay out of the way (official MTK behaviour). */
@@ -710,6 +712,23 @@ static void mtk_dvfs_apply(unsigned int loading)
 	if (target > mtk_opp_last)
 		target = mtk_opp_last;
 
+	/* fix 路径绕过了限频器：__gpufreq_generic_commit_stack() 只检查 dvfs_state
+	 * 就把给定档位直接应用，不套用 ceiling/floor。而 gpufreq_commit() 走的是
+	 * limited_commit（会套）。所以用 fix 当唯一控制面时，thermal / 电池 / fpsgo
+	 * 的限频会被完全无视 —— 必须自己把目标钳进当前生效的 ceiling。
+	 * cur_ceiling_stack 是固件汇总所有 limiter 之后的结果（下标越小频率越高，
+	 * 所以 target 必须 >= ceiling）。 */
+	{
+		int ceil_idx = gpufreq_get_cur_limit_idx(TARGET_STACK, GPUPPM_CEILING);
+
+		if (ceil_idx >= 0 && target < ceil_idx) {
+			pr_info_ratelimited(
+				"GDBG: target %d over ceiling %d, clamped\n",
+				target, ceil_idx);
+			target = ceil_idx;
+		}
+	}
+
 	if (target < cur_idx) {
 		/* Two consecutive samples before ramping keeps single-frame
 		 * spikes from pinning the GPU at max, without making the ramp
@@ -741,7 +760,7 @@ static void mtk_dvfs_apply(unsigned int loading)
 	}
 
 	if (target != cur_idx) {
-		int gpu_idx = mtk_opp_index[target];
+		int gpu_idx = mtk_opp_index[target];	/* 仅供日志参考 */
 		int stack_idx = mtk_stack_idx_for_gpu(target);
 
 		if (target == mtk_last_commit_target && ++mtk_commit_ticks < 25) {
@@ -750,31 +769,21 @@ static void mtk_dvfs_apply(unsigned int loading)
 		}
 		mtk_last_commit_target = target;
 		mtk_commit_ticks = 0;
-		/* Submit exactly like the stock driver: one TARGET_DEFAULT commit
-		 * with the GPU OPP index. With gpueb enabled the request is
-		 * forwarded to the firmware, which only honours the STACK-domain
-		 * form; a TARGET_GPU commit returns success but changes nothing.
-		 * The gpufreq backend then derives the STACK OPP itself under
-		 * Fgpu >= 1.1 * Fstack, so a second commit would undo that.
-		 */
+		/* 提交面实测（2026-10-30，xaga 5.10.257-Kirara + r54 固件）：
+		 * gpufreq_commit(TARGET_DEFAULT/STACK/GPU) 三种形式 ret=0 但固件
+		 * 一律不应用（STACK/GPU 档位纹丝不动，20s 空载采样钉死 950）；
+		 * 唯一生效的控制面是 fix 接口（CMD_FIX_TARGET_OPPIDX）——
+		 * fix STACK 到目标档后，GPU 由 EB 按 Fgpu >= 1.1*Fstack 反推跟随
+		 * （fix STACK=39 实测 GPU 活跃在 349984kHz ✓）。fix 是持久锁，
+		 * 策略每次改目标即覆盖 fix 值；模块随 kbase 生命周期不卸载。 */
 		int ret;
 
-		if (mtk_gpu_domain_ok) {
-			/* 直接提交 GPU 域：STACK 会由 __gpufreq_get_hw_constraint_fstack()
-			 * 按 Fgpu >= 1.1*Fstack 自行跟随，因此不会违反硬件约束。 */
-			ret = gpufreq_commit(TARGET_GPU, gpu_idx);
-			if (!ret)
-				mtk_gpu_req = gpu_idx;
-		} else {
-			ret = gpufreq_commit(TARGET_DEFAULT, stack_idx);
-		}
+		ret = gpufreq_fix_target_oppidx(TARGET_DEFAULT, stack_idx);
 
 		mtk_down_ticks = 0;
 		pr_info_ratelimited(
-			"GDBG commit: %d->%d %s idx=%d stack_idx=%d gpu_idx=%d ret=%d\n",
-			cur_idx, target, mtk_gpu_domain_ok ? "GPU" : "STACK",
-			mtk_gpu_domain_ok ? gpu_idx : stack_idx,
-			stack_idx, gpu_idx, ret);
+			"GDBG commit: %d->%d %s stack_idx=%d (gpu idx=%d) ret=%d\n",
+			cur_idx, target, "FIX", stack_idx, gpu_idx, ret);
 	}
 
 }

@@ -316,3 +316,158 @@ $NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang \
 3. `mtk_dvfs_apply()` —— 同档位 IPI 节流 + TARGET_GPU 探测与回退
 
 伴随新增文件级静态变量：`mtk_gpu_domain_ok`、`mtk_gpu_req`、`mtk_last_commit_target`、`mtk_commit_ticks`。
+
+---
+
+## 11. 追加修复 C（2026-10-30）：cur_idx 映射查不到时按频率解析
+
+**症状**：xaga 刷入主修复后中间档能选中并提交（commit 日志可见 idx=18/27/10 映射正确），
+但 GPU 钉死在 950 不降频。GDBG 每一行 `cur=4` 永远不变。
+
+**根因**：950 固件补丁让 raw idx 0/1 **都是 950000**，STACK 域反推恰好落到 **idx 1**；
+而 `mtk_opp_table_init()` 去重后映射表只登记了 idx 0。`mtk_dvfs_apply()` 里
+`gpufreq_get_cur_oppidx(TARGET_GPU)` 返回 1，在映射表里查不到，代码落到了
+`cur_idx = mtk_opp_last`（350 档）——策略从此认为自己在 350，util 再低也判
+"无需动作"，开环钉死在最高档。
+
+**修法**：映射查不到时**按当前频率解析策略档**（表按频率降序，第一个
+`<= 当前频率` 的即当前档），不再默认最低档：
+
+```c
+	if (cur_idx == mtk_opp_last) {
+		int freq_khz = gpufreq_get_cur_freq(TARGET_GPU);
+
+		if (freq_khz > 0)
+			for (i = 0; i <= mtk_opp_last; i++)
+				if (mtk_opp_freq[i] <= freq_khz) {
+					cur_idx = i;
+					break;
+				}
+	}
+```
+
+> 本文第 10 节配套的 `files/mtk_platform_dvfs.c` 与 `final/mtk_platform_dvfs.c`
+> 之前是**主修复之前的中间快照**（含修复 A/B、缺主修复），已同步为内核树
+> （xaga_kernel_5.10）的权威版本。
+
+**部署**：xaga 走 new-port 流水线（payload/xaga_r54 换装重编模块，vermagic 由
+补丁统一改写为 226），super 重打后 md5 `319ec6ca…`。corot 若要同步此修复：
+ext4 remount + cp 同一个 `mtk_platform_dvfs.c` 重编出的模块，vermagic 按
+第 7 节改写为 5.10.209。
+
+---
+
+# 附录 A：为什么 xaga 的 commit 路径无效（静态分析）
+
+## A.1 「ret=0 但档位不动」的出处
+
+`gpufreq_mt6895.c` 里 `__gpufreq_generic_commit_stack()` 的第一道门（约 1040 行）：
+
+```c
+int __gpufreq_generic_commit_stack(int target_oppidx, enum gpufreq_dvfs_state key)
+{
+	...
+	mutex_lock(&gpufreq_lock);
+
+	/* check dvfs state */
+	if (g_dvfs_state & ~key) {
+		GPUFREQ_LOGD("unavailable DVFS state (0x%x)", g_dvfs_state);
+		ret = GPUFREQ_SUCCESS;      /* ← 静默丢弃，返回 0 */
+		goto done_unlock;
+	}
+	...
+```
+
+`key` 不是"要设置成什么状态"，而是**"这次提交允许在哪些 dvfs_state 位下才生效"的掩码**。
+状态定义（`gpufreq_v2.h`）：
+
+```c
+enum gpufreq_dvfs_state {
+	DVFS_FREE        = 0,
+	DVFS_DISABLE     = 1 << 0,   /* 0x01 */
+	DVFS_POWEROFF    = 1 << 1,   /* 0x02 */
+	DVFS_DEBUG_KEEP  = 1 << 2,   /* 0x04 */
+	DVFS_AVS_KEEP    = 1 << 3,   /* 0x08 */
+	DVFS_AGING_KEEP  = 1 << 4,   /* 0x10 */
+};
+```
+
+对照两种调用：
+
+| 路径 | 前置动作 | 提交时的 `key` | 门判据 |
+|---|---|---|---|
+| 普通 `gpufreq_commit()` | 无 | `DVFS_FREE` (=0) | `g_dvfs_state & ~0` = `g_dvfs_state`，**只要状态非 0 就丢弃** |
+| `gpufreq_fix_target_oppidx()` | 先 `__gpufreq_set_dvfs_state(true, DVFS_DEBUG_KEEP)` | `DVFS_DEBUG_KEEP` (=4) | `g_dvfs_state & ~4`，状态为 4 时通过 |
+
+所以 xaga 上「ret=0 但 STACK/GPU 档位纹丝不动」不是失败，
+**是固件按设计把这个请求当成"当前状态不允许"而静默丢弃并返回成功**。
+
+## A.2 为什么 corot 没这个问题
+
+两个 gpueb 固件是同族（RV33，payload 都以 `6f 00 c0 0a` 开头、都嵌了同一份 MTK gpufreq v2 代码，
+连 `gpufreq_ipi_handler` / `gpu_fdvfs_ipi_handler` / `invalid IPI cmd: %d` 这些字符串都一模一样），
+但**构建内容差很多**：
+
+| | xaga | corot |
+|---|---|---|
+| 固件文件 | 131,072 B（原版） | 430,080 B |
+| payload | 126,764 B | 421,688 B |
+| 独有可读字符串 | 31 条 | **551 条** |
+| 是否含 `middleware/gpu_fastdvfs/mt6895/src/fast_dvfs_ipi.c` | **否** | **是** |
+
+corot 多出来的是 **GPU fast-DVFS IPI 中间件**。`CMD_COMMIT` 在 corot 上由这层中间件直接应用，
+不经过 embedded gpufreq 的 `g_dvfs_state` 门；xaga 没有这层，`CMD_COMMIT` 落到 embedded
+gpufreq 的 commit，被 A.1 那道门吃掉。
+
+**结论：这是固件构建差异，不是驱动代码差异。**
+xaga 上没有任何驱动侧改动能把 commit 变生效——`CMD_FIX_TARGET_OPPIDX` 是唯一可用的控制面。
+
+## A.3 FIX 的两个副作用（必须处理）
+
+### 副作用 1：用过 FIX 之后，普通 commit 永久失效
+
+FIX 会把 `g_dvfs_state` 置成 `DVFS_DEBUG_KEEP`(0x4)。此后普通 commit 的 `key=0`，
+`0x4 & ~0 = 0x4 ≠ 0` → 每次都被门吃掉。要么**全程只用 FIX**，要么先发一次
+`gpufreq_fix_target_oppidx(TARGET_DEFAULT, -1)` 把状态清回 `DVFS_FREE`。
+
+### 副作用 2：FIX 绕过限频器 → thermal 失效（危险）
+
+`__gpufreq_generic_commit_stack()` 内部**不套用 ceiling/floor**，它只做：
+校验下标 → 过状态门 → 直接 `__gpufreq_scale_gpu()` 应用。
+
+限频器（thermal / 电池 / fpsgo）是在上层 `limited_commit` 里套的，而 `gpufreq_fix_target_oppidx()`
+走的是 `fix_target_oppidx_stack()`，直接调 `generic_commit_stack()`，**完全不经过限频器**。
+
+也就是说：只用 FIX 当控制面，GPU 会被钉在你给的档位，**温度再高也不会降**。
+
+**补救（已实现）**：策略自己把目标钳进当前生效的 ceiling。
+
+```c
+	/* gpufreq_get_cur_limit_idx 在 EB 模式下读的是固件 shared_status 里
+	 * 汇总完所有 limiter 之后的 cur_ceiling_stack / cur_floor_stack。 */
+	{
+		int ceil_idx = gpufreq_get_cur_limit_idx(TARGET_STACK, GPUPPM_CEILING);
+
+		if (ceil_idx >= 0 && target < ceil_idx) {
+			pr_info_ratelimited("GDBG: target %d over ceiling %d, clamped\n",
+				target, ceil_idx);
+			target = ceil_idx;
+		}
+	}
+```
+
+下标越小频率越高，所以钳位方向是 `target = max(target, ceiling)`。
+`cur_ceiling_stack` 已经是 max(SEGMENT, THERMAL_AP, THERMAL_EB, SRAMRC, BATT_OC, BATT_PERCENT,
+LOW_BATT, PBM, APIBOOST, FPSGO) 的结果，钳一次就够。
+
+## A.4 xaga 验收
+
+```
+dmesg | grep GDBG
+#  期望：dom 走 FIX，cur= 跟随 target（不再冻结）
+#  出现 "over ceiling" 说明 thermal 钳位在起作用（这是好事）
+
+cat /proc/gpufreqv2/gpufreq_status
+#  空载 [GPU-OPP] 落到 5（350）
+#  压负载 ramp 过程中经过 2/3/4（800/610/430）
+```
