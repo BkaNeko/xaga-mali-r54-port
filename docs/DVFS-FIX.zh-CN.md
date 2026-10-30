@@ -946,3 +946,50 @@ fix 置上 `DVFS_DEBUG_KEEP(0x4)` 之后，`g_dvfs_state = 0x6`（POWEROFF|DEBUG
 
 要在 xaga 上真正实现自建调度，必须改 gpueb 固件里的 governor 本身（RV33 代码），
 那是重写固件，不在可行范围内。
+
+---
+
+## 12. 收官（2026-10-31）：FDVFS 通路打通后的完整闭环与两处收尾修正
+
+交接后接手的验证与收尾，全部已实机部署：
+
+### 12.1 ged.ko 强制启用 FDVFS 支持（阀门）
+
+xaga 的 DT（Kirara 底包）**没有** `mediatek,gpueb` / `mediatek,gpu_fdvfs` 节点，
+`check_eb_config()` 会把两个 support 标志清零 → `ged_is_fdvfs_support()`=false →
+GED 的全部提交（每帧 `SET_FEEDBACK_INFO` + `SET_NEW_FREQ` 档位提交）掉进
+`gpufreq_commit` 死路——**这就是固件 governor 只用两档的真正原因：EB 收不到
+GED 的帧级反馈，只能用自己粗糙的计数器跑 bang-bang。**
+
+修法：`ged_main.c` 增加 `ged_force_fdvfs`（module_param，默认 1）——DT 缺节点时
+强制置位两个标志。FDVFS 的 IPI 通道按名字注册、不依赖 DT；fix 实验已证明
+固件认 FDVFS 命令（fix STACK=39 → GPU 稳定 350）。运行时可经
+`/sys/module/ged/parameters/ged_force_fdvfs` 关闭回退。
+
+**打通后的实测轨迹**（4 路 1280x720）：`1 1 1 5 5 2 1 5 5 4 3 5 1 2 5…` ——
+800/610/430 中间档随负载连续出现。**此前「中间档是固件设计限制」的结论
+作废：EB governor 本来就支持全档位，缺的只是 GED 的喂数据链路。**
+
+### 12.2 mtk_platform_dvfs 提交面切换 fix 接口 + cur_idx 频率回退
+
+- `cur_idx` 解析：raw idx 1（950 固件补丁的重复档）不在去重映射表里时，
+  按当前频率解析策略档，不再默认落到最低档（否则策略把实际 950 当 350，
+  永不降频）。
+- 自建策略的提交面从 `gpufreq_commit` 切到 `gpufreq_fix_target_oppidx`
+  （本机 gpueb 无视前者）。注意：策略随后已按 12.1 关闭（mtk_policy_enable=0），
+  频率交回 GED-FDVFS 闭环——本条保留作为 fix 接口行为的记录。
+
+### 12.3 mtk_platform_common 撤除下电压档钩子
+
+GED-FDVFS 打通后，下电钩子的「压到最低档」提交开始真实生效：持续负载下
+GPU 帧间掉电触发钩子 → 频率被砸回 350 → EB 重新拉上 950 → 循环，
+4 路满载实测 950/350 振荡。钩子的原始使命（防下电残留高档）已被闭环覆盖
+——**GPU 断电后零功耗，/proc 里的高档位只是共享内存残留值**。钩子已撤，
+唤醒首帧高档起步由 GED governor 数帧内自行回落。
+
+### 12.4 产物与部署
+
+- `blobs/vendor_dlkm/`：mali_kbase（撤钩子版）、ged（force_fdvfs 版）、
+  mtk_gpufreq_mt6895/wrapper（带 fix 导出的重编版，原厂同名 1:1 替换）
+- xaga 侧经 new-port 流水线重打 vendor_dlkm 后 dd 部署，实机验证：
+  空载 350、负载 950、中间档随负载浮动、停载回落

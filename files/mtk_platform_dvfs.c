@@ -457,6 +457,10 @@ static int mtk_up_ticks;
  * 白白增加 IPI 流量（实测 index 0 达不到时会一直刷 "2->0"）。改成同档位最多
  * 1 秒重发一次，作为 gpueb 丢包的兜底。 */
 static int mtk_last_commit_target = -1;
+/* 利用率的指数平滑（说明见 mtk_dvfs_apply）。weight 8 → 时间常数约 320ms。 */
+#define MTK_AVG_WEIGHT	8
+static unsigned int mtk_avg;
+
 static int mtk_commit_ticks;
 /* 这台机器的 gpueb 用 STACK 域反推 GPU 档，最高只能到 800MHz（STACK 表上限 695，
  * 且 __gpufreq_get_hw_constraint_fgpu 的 i>0 循环永远够不到 index 0）。策略若
@@ -472,7 +476,12 @@ static bool mtk_runtime_tuned;
  * tracks the STACK domain), so this policy is the one that actually scales the
  * GPU core frequency. Set to 0 only for experiments: the GPU then stays at the
  * lowest OPP even at 100% utilisation. */
-static unsigned int mtk_policy_enable_param = 1;
+/* xaga 的 gpueb 固件自带 DVFS governor（实证见 docs/DVFS-FIX.zh-CN.md 附录 F：
+ * 关掉本策略后行为完全不变——空闲 350/219、满载 950、停载回落）。AP 侧的 commit
+ * 只是建议，随时被固件覆盖，跑策略等于每 40ms 空转。默认关闭；
+ * 需要接管时 `echo 1 > /sys/module/mali_kbase_mt6895/parameters/mtk_policy_enable`。
+ * 下电压档钩子（mtk_dvfs_commit_idle）不受此开关影响，仍然生效。 */
+static unsigned int mtk_policy_enable_param = 0;
 module_param_named(mtk_policy_enable, mtk_policy_enable_param, uint, 0644);
 MODULE_PARM_DESC(mtk_policy_enable,
 	"let the in-driver DVFS policy commit OPPs (default 0: GED owns DVFS)");
@@ -611,7 +620,14 @@ static int mtk_stack_idx_for_gpu(int gpu_idx)
 
 	gpu_freq = mtk_opp_freq[gpu_idx];
 
-	/* 用和内核 __gpufreq_get_hw_constraint_fstack() 完全相同的规则：在满足
+	/* GPU 已在最低档（= 空闲）时，STACK 直接压到最低档。
+	 * 约束 Fgpu >= 1.1 * Fstack 只给 STACK 一个**上界**（GPU 350 时是 318MHz），
+	 * 并不要求 STACK 待在上界。空闲没有带宽需求，停 317 纯属浪费，
+	 * 而 STACK 的最低档是 219MHz。 */
+	if (gpu_idx == mtk_opp_last)
+		return mtk_stack_last;
+
+	/* 非空闲时用和内核 __gpufreq_get_hw_constraint_fstack() 相同的规则：在满足
 	 * Fgpu >= 1.1 * Fstack 的前提下选"最高"的 STACK 档（mtk_stack_freq[] 下标
 	 * 0 是最高频，往下递增，所以第一个满足的就是最高可用档）。
 	 *
@@ -631,7 +647,7 @@ static void mtk_dvfs_apply(unsigned int loading)
 {
 	struct kbase_device *kbdev =
 		(struct kbase_device *)mtk_common_get_kbdev();
-	int cur_idx, target = -1, raw_idx, i;
+	int cur_idx, target, raw_idx, i;
 
 	raw_idx = gpufreq_get_cur_oppidx(TARGET_GPU);
 	if (raw_idx < 0)
@@ -674,7 +690,9 @@ static void mtk_dvfs_apply(unsigned int loading)
 	if (!IS_ERR_OR_NULL(kbdev))
 		mtk_common_notify_gpu_freq_change();
 
-	pr_info_ratelimited("GDBG: util=%u cur=%d up=%d hold=%d down=%d dom=FIX\n",
+	target = cur_idx;
+
+	pr_info_ratelimited("GDBG: util=%u cur=%d up=%d hold=%d down=%d dom=STACK\n",
 		loading, cur_idx, mtk_up_ticks, mtk_hold_ticks, mtk_down_ticks);
 
 	/* If GED committed a frequency recently it is driving DVFS itself;
@@ -698,66 +716,44 @@ static void mtk_dvfs_apply(unsigned int loading)
 	 * sustained workload, which is why only 950 and 350 MHz were ever
 	 * observed -- the middle OPPs never got a chance.
 	 */
-	if (loading >= 90)
-		target = 0;
-	else if (loading >= 70)
-		target = 1;
-	else if (loading >= 45)
-		target = 2;
-	else if (loading >= 20)
-		target = 3;
-	else
-		target = mtk_opp_last;	/* lowest available OPP */
-
-	if (target > mtk_opp_last)
-		target = mtk_opp_last;
-
-	/* fix 路径绕过了限频器：__gpufreq_generic_commit_stack() 只检查 dvfs_state
-	 * 就把给定档位直接应用，不套用 ceiling/floor。而 gpufreq_commit() 走的是
-	 * limited_commit（会套）。所以用 fix 当唯一控制面时，thermal / 电池 / fpsgo
-	 * 的限频会被完全无视 —— 必须自己把目标钳进当前生效的 ceiling。
-	 * cur_ceiling_stack 是固件汇总所有 limiter 之后的结果（下标越小频率越高，
-	 * 所以 target 必须 >= ceiling）。 */
-	{
-		int ceil_idx = gpufreq_get_cur_limit_idx(TARGET_STACK, GPUPPM_CEILING);
-
-		if (ceil_idx >= 0 && target < ceil_idx) {
-			pr_info_ratelimited(
-				"GDBG: target %d over ceiling %d, clamped\n",
-				target, ceil_idx);
-			target = ceil_idx;
+	/* 瞬时利用率是突发型的：实测取值只落在 0~16 和 100 两端，20~70 这段几乎
+	 * 从不出现（UI 一帧画完就歇，40ms 采样窗口要么覆盖整帧、要么什么都没赶上）。
+	 * 直接拿瞬时值判档，策略就只会在最高档和最低档之间弹——现象就是"只有
+	 * 219 和 950"。这里做指数平滑（时间常数约 8 拍 = 320ms），把突发负载摊成
+	 * 中间值，20~70 这几个档位才有机会被选中。
+	 */
+	/* 利用率是双极性的，阈值判档拿不到中间值。
+	 *
+	 * 实测（60 秒日常使用、200 次采样）：GPU 只跑过 950 和 350，中间档一次没有；
+	 * GPU 下电时策略根本不 tick（kbase 的 DVFS 定时器只在 GPU 上电时跑），所以
+	 * 平滑也没有机会衰减——只要策略在跑就是"有活"，util 恒接近 100。
+	 *
+	 * 改成阶梯爬坡：util 只有"有活/没活"两种状态，就用它来决定"往上走还是往下走"，
+	 * 而每次只走一档：
+	 *   - 持续有活（>=60）→ 每 2 拍（80ms）升一档：350→430→610→800→950
+	 *   - 持续没活（<=20）→ 每 8 拍（320ms）降一档
+	 * 这样中间档必然被经过，且不会在两端弹。
+	 */
+	if (loading >= 60) {
+		if (++mtk_up_ticks >= 2) {
+			mtk_up_ticks = 0;
+			mtk_down_ticks = 0;
+			if (cur_idx > 0)
+				target = cur_idx - 1;
 		}
-	}
-
-	if (target < cur_idx) {
-		/* Two consecutive samples before ramping keeps single-frame
-		 * spikes from pinning the GPU at max, without making the ramp
-		 * miss when utilisation hovers around a threshold. */
-		if (++mtk_up_ticks < 2)
-			return;
-		mtk_up_ticks = 0;
-		mtk_hold_ticks = 5;	/* 100ms at the new OPP before stepping down */
-		mtk_down_ticks = 0;
-	} else if (target > cur_idx) {
-		mtk_up_ticks = 0;
-		if (mtk_hold_ticks > 0) {
-			mtk_hold_ticks--;
-			return;
+	} else if (loading <= 20) {
+		if (++mtk_down_ticks >= 8) {
+			mtk_down_ticks = 0;
+			mtk_up_ticks = 0;
+			if (cur_idx < mtk_opp_last)
+				target = cur_idx + 1;
 		}
-		/* Step down one OPP at a time after a short confirmation window.
-		 * The old value (50 ticks = 1s) was far longer than the 40ms the
-		 * ramp-up needs, so once the governor reached the top OPP it
-		 * stayed there through every brief dip and the intermediate OPPs
-		 * were never selected in practice.
-		 */
-		if (++mtk_down_ticks < 8)	/* 160ms */
-			return;
 	} else {
-		mtk_down_ticks = 0;
-		mtk_hold_ticks = 0;
 		mtk_up_ticks = 0;
-		return;
+		mtk_down_ticks = 0;
 	}
+
+	/* 前面声明时 target 已初始化为 cur_idx（不升不降就不提交） */
 
 	if (target != cur_idx) {
 		int gpu_idx = mtk_opp_index[target];	/* 仅供日志参考 */
@@ -769,21 +765,31 @@ static void mtk_dvfs_apply(unsigned int loading)
 		}
 		mtk_last_commit_target = target;
 		mtk_commit_ticks = 0;
-		/* 提交面实测（2026-10-30，xaga 5.10.257-Kirara + r54 固件）：
-		 * gpufreq_commit(TARGET_DEFAULT/STACK/GPU) 三种形式 ret=0 但固件
-		 * 一律不应用（STACK/GPU 档位纹丝不动，20s 空载采样钉死 950）；
-		 * 唯一生效的控制面是 fix 接口（CMD_FIX_TARGET_OPPIDX）——
-		 * fix STACK 到目标档后，GPU 由 EB 按 Fgpu >= 1.1*Fstack 反推跟随
-		 * （fix STACK=39 实测 GPU 活跃在 349984kHz ✓）。fix 是持久锁，
-		 * 策略每次改目标即覆盖 fix 值；模块随 kbase 生命周期不卸载。 */
-		int ret;
-
-		ret = gpufreq_fix_target_oppidx(TARGET_DEFAULT, stack_idx);
+		/* 用 commit 而不是 fix，理由见 docs/DVFS-FIX.zh-CN.md 附录 A：
+		 *
+		 * 1. fix（CMD_FIX_TARGET_OPPIDX）走 __gpufreq_fix_target_oppidx_stack()，
+		 *    直接调 __gpufreq_generic_commit_stack()，**不经过 limited_commit**，
+		 *    所以 ceiling/floor（thermal、电池、fpsgo）全被跳过 —— 拿它做
+		 *    周期调频会把 GPU 钉死。
+		 * 2. fix 入口先 __gpufreq_power_control(POWER_ON)，每 40ms 一次会把
+		 *    已经下电的 GPU 反复拉起来。
+		 * 3. fix 置上 DVFS_DEBUG_KEEP 之后，普通 commit 的 key(DVFS_FREE)
+		 *    再也过不了状态门，只有 fix(-1) 能清。
+		 *
+		 * 空载时 commit 返回 0 但档位不动是**设计**：此时 g_dvfs_state 含
+		 * DVFS_POWEROFF(0x2)，状态门 if (g_dvfs_state & ~DVFS_FREE) 直接丢弃，
+		 * 而那一刻的 GPU-OPP 只是上次成功提交的残留值，不是实际频率。
+		 */
+		/* 实验：直接提交 GPU 域，绕开固件「stack 反推 GPU」那条路径。
+		 * 反推函数永远返回不了 index 0（实测 stack 到顶 852 时只给 index 1），
+		 * 所以 6 条表项里 index 0 是死槽，想同时保留 950 和 880 就只能直设 GPU。
+		 * 若固件忽略本提交（ret=0 但档位不动），下一拍的 cur_idx 会露馅。 */
+		int ret = gpufreq_commit(TARGET_DEFAULT, stack_idx);
 
 		mtk_down_ticks = 0;
 		pr_info_ratelimited(
-			"GDBG commit: %d->%d %s stack_idx=%d (gpu idx=%d) ret=%d\n",
-			cur_idx, target, "FIX", stack_idx, gpu_idx, ret);
+			"GDBG commit: %d->%d STACK stack_idx=%d (gpu idx=%d) ret=%d\n",
+			cur_idx, target, stack_idx, gpu_idx, ret);
 	}
 
 }
@@ -915,6 +921,27 @@ static void mtk_gpu_cdev_register_once(void)
 		pr_info("mtk-gpufreq: thermal cooling device registered (max_state %d)\n",
 			mtk_opp_last);
 	}
+}
+
+/* 在 GPU 真正下电之前把目标档位压到最低。
+ *
+ * 下电后 g_dvfs_state 会带上 DVFS_POWEROFF(0x2)，而普通 commit 的 key 是
+ * DVFS_FREE(0)，状态门 if (g_dvfs_state & ~key) 会直接把提交丢弃并返回 0。
+ * 于是 shared_status 里的 GPU-OPP 就停在最后一次成功的激进值上（实测 950），
+ * 下次唤醒时 GPU 从 950 起步。这里趁还上电先提交一次最低档。
+ *
+ * 若此刻状态已经是 POWEROFF，commit 会被丢弃——无害。
+ */
+void mtk_dvfs_commit_idle(void)
+{
+	int stack_idx;
+
+	if (mtk_opp_last < 0 || mtk_stack_last < 0)
+		return;
+
+	stack_idx = mtk_stack_idx_for_gpu(mtk_opp_last);
+	pr_info_ratelimited("GDBG idle: commit lowest stack_idx=%d\n", stack_idx);
+	gpufreq_commit(TARGET_DEFAULT, stack_idx);
 }
 
 void mtk_dvfs_policy_start(void)
