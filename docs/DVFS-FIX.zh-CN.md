@@ -551,3 +551,91 @@ RV33 payload 是未压缩的 RISC-V 代码，可反汇编，但 0x200 处不是�
 
 **不过 A.6 的判据 2 可以替代它**：如果带负载时 `FmeterFreq` 跟随 `GPU-OPP`，说明
 commit 链路是通的，上面这个未经证实的环节也就无关紧要了。
+
+---
+
+# 附录 B：xaga 的 vendor_dlkm 重打包踩坑记录
+
+> 结论先写：**xaga 上不要手工 `mkfs.erofs` 重打 vendor_dlkm 再 dd 进 super**。
+> 内容全对也起不来，必须走 `new-port` 那条流水线。下面是证据，避免后人重走。
+
+## B.1 xaga 的模块加载链路
+
+```
+/vendor/bin/init.insmod.sh          ← 加载器脚本（在 /vendor，不在 /vendor_dlkm）
+  arg="$(cat /vendor/lib/modules/modules.load)"
+  modprobe -a -d /vendor/lib/modules $arg
+
+/vendor/lib/modules  ->  /vendor_dlkm/lib/modules     ← 是个软链接，不是副本
+```
+
+所以改 `vendor_dlkm` 等于改模块来源，`modules.load`（202 个条目）+ `modules.dep` 决定顺序。
+
+## B.2 正确的 erofs 参数
+
+从原厂/流水线镜像的 superblock 反推：
+
+| 参数 | 值 |
+|---|---|
+| blocksize | 4096 |
+| 压缩 | **`-z lz4`**（不是 lz4hc） |
+| fs 大小 | 22,507,520 字节 = **5495 块** |
+| features | sb_csum mtime xattr_filter 0padding |
+| UUID | 48b3bb67-b202-288c-b3bd-7f07a3ed160d |
+| 分区 | 44,832 扇区 = 22,953,984 字节 |
+
+用 `-z lz4` 打出来正好 22,507,520 字节 / 5495 块，和原镜像**完全一致**；
+用 `-z lz4hc` 会得到 19,795,968 字节（压缩率更好，但不是原厂格式）。
+
+```bash
+mkfs.erofs -b 4096 -z lz4 -U 48b3bb67-b202-288c-b3bd-7f07a3ed160d out.img rootdir/
+```
+
+原镜像尾部：`AVBf` 在 offset 22,953,920（最后 64 字节），前面 446,464 字节是 AVB hashtree。
+`vendor_dlkm` 的 fstab 挂载项是 `ro wait,slotselect,logical,first_stage_mount`，**没有 `avb=`**，
+但 footer 仍然存在——不要试图去掉它。
+
+## B.3 为什么手工重打包会卡开机（现象与排查）
+
+写进去之后的表现：
+
+```
+sys.boot_completed 一直为空
+init.svc.surfaceflinger = restarting     ← 无限重启
+lsmod | grep -c mali = 0                 ← GPU 驱动没加载
+```
+
+`/vendor_dlkm` 本身**挂载成功**，文件也**全部可读**：
+
+| 验证项 | 结果 |
+|---|---|
+| 232 个文件逐个比大小 | 与原镜像完全一致 |
+| 大文件 md5（ged / wlan / mtk_aie） | 与主机侧完全一致 |
+| SELinux 标签 | `lib/modules/*` = `vendor_file`、`etc/*` = `vendor_configs_file`，与原镜像一致 |
+| `.modinfo`（name/depends/vermagic） | 与原版一字不差 |
+| `__versions` CRC 表 | 22,848 字节完全相同 |
+| erofs blocks / features / UUID | 与原镜像一致 |
+
+但模块加载是**级联缺席**的：`modules.load` 里约 180/202 个加载成功，缺的恰好是 GPU 这条链：
+
+```
+mtk_rpmsg_mbox → mtk_tinysys_ipi → gpueb → mtk_gpufreq_wrapper
+  → mtk_gpufreq_mt6895 → ged → mali_kbase_mt6895
+```
+
+**关键反证**：卡住的状态下，手动 `insmod` 这些模块**能成功**
+（`mtk_rpmsg_mbox` / `mtk_tinysys_ipi` / `zsmalloc` / `zram` / `gpueb` 全 OK）。
+
+→ 文件内容没问题，是**开机时那批 `modprobe` 没有跑完**。
+
+## B.4 没定位到的点
+
+用原版 kbase 重打包（split test）**同样卡开机**，所以跟改不改 kbase 无关，
+是「手工 erofs 镜像」本身的问题。
+
+已排除：内容、大小、标签、权限、modinfo、符号 CRC、erofs feature/UUID/块数。
+未排除：目录项（dirent）物理顺序、inode 布局、mtime 精度（原镜像 `build_time=1793294235`，
+`build_time_nsec=269716`，`mkfs.erofs 1.8.6` 不支持 `--mkfs-time-nsec`，无法完全复刻）。
+
+**下一步正解**：拿一份流水线产出的可开机镜像，和手工镜像做二进制 diff，
+差异点就是根因所在。在那之前不要在 xaga 上手工重打包 vendor_dlkm。
